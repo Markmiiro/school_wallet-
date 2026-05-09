@@ -1,9 +1,9 @@
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Boolean
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
 from app.database import Base
-
 
 # USERS
 class User(Base):
@@ -51,6 +51,7 @@ class Wallet(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     balance = Column(Float, default=0)
+    is_active = Column(Boolean, default=True)
 
     student_id = Column(Integer, ForeignKey("students.id"))
 
@@ -81,12 +82,17 @@ class NFCTag(Base):
     __tablename__ = "nfc_tags"
 
     id = Column(Integer, primary_key=True, index=True)
-    tag_uid = Column(String, unique=True)
 
+    # Physical NFC unique ID
+    tag_uid = Column(String, unique=True, nullable=True)
+
+    # Can this tag make payments?
+    is_active = Column(Boolean, default=True)
+
+    # Which student owns this tag
     student_id = Column(Integer, ForeignKey("students.id"))
 
     student = relationship("Student", back_populates="nfc_tag")
-
 
 # MERCHANTS
 class Merchant(Base):
