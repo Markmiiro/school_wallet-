@@ -1,3 +1,39 @@
-echo "venv/" >> .gitignore
-echo "__pycache__/" >> .gitignore
-echo ".env" >> .gitignoretest.db
+# ================================================
+# .gitignore
+# ------------------------------------------------
+# Files that should NEVER go to GitHub
+# ================================================
+
+# ── SECRET KEYS ─────────────────────────────────
+# Contains your database URL, Flutterwave keys etc
+# If this goes to GitHub anyone can steal your data
+.env
+
+# ── DATABASE FILES ───────────────────────────────
+# These are local test files — not for GitHub
+*.db
+*.sqlite3
+test.db
+school_wallet.db
+
+# ── VIRTUAL ENVIRONMENT ──────────────────────────
+# Huge folder — everyone creates their own locally
+venv/
+.venv/
+env/
+
+# ── PYTHON CACHE FILES ───────────────────────────
+# Auto-generated — never commit these
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── IDE FILES ────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── OS FILES ─────────────────────────────────────
+.DS_Store
+Thumbs.db

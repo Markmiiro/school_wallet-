@@ -49,6 +49,39 @@ def test_connection():
 
 # Create tables
 def create_tables():
-    from app import models
+    """
+    Creates tables AND adds any missing columns automatically.
+    This means you never need to delete the database when
+    you add a new column to a model.
+    """
+    from app import models  # noqa
     Base.metadata.create_all(bind=engine)
     print("✅ Tables created")
+
+    # ── Auto-add missing columns ──────────────────
+    # This runs raw SQL to add columns that don't exist yet
+    # Safe to run many times — skips columns that already exist
+    with engine.connect() as conn:
+        add_column_if_missing(conn, "wallets",      "daily_limit", "INTEGER DEFAULT 20000")
+        add_column_if_missing(conn, "wallets",      "is_active",   "BOOLEAN DEFAULT 1")
+        add_column_if_missing(conn, "transactions", "status",      "VARCHAR DEFAULT 'pending'")
+        add_column_if_missing(conn, "transactions", "reference",   "VARCHAR")
+        add_column_if_missing(conn, "transactions", "momo_phone",  "VARCHAR")
+        add_column_if_missing(conn, "transactions", "description", "VARCHAR")
+        add_column_if_missing(conn, "merchants",    "momo_phone",  "VARCHAR")
+        add_column_if_missing(conn, "nfc_tags",     "is_active",   "BOOLEAN DEFAULT 1")
+        conn.commit()
+    print("✅ All columns verified")
+
+
+def add_column_if_missing(conn, table: str, column: str, col_type: str):
+    """
+    Adds a column to a table only if it does not already exist.
+    Prevents errors when the column is already there.
+    """
+    try:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+        print(f"   ➕ Added column: {table}.{column}")
+    except Exception:
+        # Column already exists — skip silently
+        pass

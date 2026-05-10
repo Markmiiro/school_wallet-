@@ -48,34 +48,33 @@ class Student(Base):
 # WALLETS
 class Wallet(Base):
     __tablename__ = "wallets"
-
-    id = Column(Integer, primary_key=True, index=True)
-    balance = Column(Float, default=0)
-    is_active = Column(Boolean, default=True)
-
-    student_id = Column(Integer, ForeignKey("students.id"))
-
-    student = relationship("Student", back_populates="wallet")
+    id          = Column(Integer, primary_key=True, index=True)
+    balance     = Column(Float, default=0)
+    is_active   = Column(Boolean, default=True)
+    daily_limit = Column(Integer, default=20000)  # ← add this line
+    student_id  = Column(Integer, ForeignKey("students.id"))
+    student     = relationship("Student", back_populates="wallet")
     transactions = relationship("Transaction", back_populates="wallet")
-    payments = relationship("Payment", back_populates="wallet")
-
+    payments    = relationship("Payment", back_populates="wallet")
 
 # TRANSACTIONS
 class Transaction(Base):
     __tablename__ = "transactions"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id          = Column(Integer, primary_key=True, index=True)
+    wallet_id   = Column(Integer, ForeignKey("wallets.id"))
+    merchant_id = Column(Integer, ForeignKey("merchants.id"), nullable=True)
+    amount      = Column(Float)
+    type        = Column(String)          # "topup" or "payment"
+    status      = Column(String, default="pending")  # "pending", "completed", "failed"
+    reference   = Column(String, nullable=True)      # Flutterwave reference ID
+    momo_phone  = Column(String, nullable=True)      # phone used for payment
+    description = Column(String, nullable=True)      # note e.g. "Lunch money"
+    timestamp   = Column(DateTime, default=datetime.utcnow)
 
-    wallet_id = Column(Integer, ForeignKey("wallets.id"))
-    merchant_id = Column(Integer, ForeignKey("merchants.id"))
-
-    amount = Column(Float)
-    type = Column(String)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-    wallet = relationship("Wallet", back_populates="transactions")
-    merchant = relationship("Merchant", back_populates="transactions")
-
+    # Relationships
+    wallet      = relationship("Wallet", back_populates="transactions")
+    merchant    = relationship("Merchant", back_populates="transactions")
 
 # NFC TAGS
 class NFCTag(Base):
@@ -97,14 +96,11 @@ class NFCTag(Base):
 # MERCHANTS
 class Merchant(Base):
     __tablename__ = "merchants"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String)
-
-    school_id = Column(Integer, ForeignKey("schools.id"))
-
+    id         = Column(Integer, primary_key=True, index=True)
+    name       = Column(String)
+    school_id  = Column(Integer, ForeignKey("schools.id"))
+    momo_phone = Column(String, nullable=True)  # ← add this line
     transactions = relationship("Transaction", back_populates="merchant")
-
 
 # PAYMENTS
 class Payment(Base):
