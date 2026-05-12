@@ -4,8 +4,11 @@ from datetime import datetime, date
 
 from app.database import get_db
 from app.models import Wallet, Merchant, Transaction
-
+from app.sms import sms_payment_alert, sms_low_balance_alert
+from app.models import Student, User
 router = APIRouter()
+
+
 
 
 # ================================================
@@ -111,6 +114,51 @@ def make_payment(
     print(f"   Merchant:       {merchant.name}")
     print(f"   Amount:         UGX {amount:,}")
     print(f"   New balance:    UGX {wallet.balance:,}")
+
+    # ── SEND SMS TO PARENT ──────────────────────
+    print("🔍 DEBUG: Starting SMS block...")
+    try:
+        print(f"🔍 DEBUG: Looking for student with wallet_id={wallet.student_id}")
+        student = db.query(Student).filter(
+            Student.id == wallet.student_id
+        ).first()
+
+        print(f"🔍 DEBUG: Student found = {student}")
+
+        if student:
+            print(f"🔍 DEBUG: Looking for parent with id={student.parent_id}")
+            parent = db.query(User).filter(
+                User.id == student.parent_id
+            ).first()
+
+            print(f"🔍 DEBUG: Parent found = {parent}")
+
+            if parent:
+                print(f"🔍 DEBUG: Sending SMS to {parent.phone}")
+                sms_payment_alert(
+                    parent_phone=parent.phone,
+                    student_name=student.name,
+                    amount=amount,
+                    merchant_name=merchant.name,
+                    remaining_balance=wallet.balance,
+                    timestamp=txn.timestamp.strftime("%d %b %I:%M%p"),
+                )
+
+                if wallet.balance < 2000:
+                    sms_low_balance_alert(
+                        parent_phone=parent.phone,
+                        student_name=student.name,
+                        remaining_balance=wallet.balance,
+                    )
+        else:
+            print("🔍 DEBUG: No student found — SMS skipped")
+
+    except Exception as e:
+        print(f"⚠️  SMS notification failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("🔍 DEBUG: SMS block finished")
 
     return {
         "message": "Payment successful ✅",

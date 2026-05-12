@@ -81,3 +81,4 @@ wsproto==1.0.0
 xcffib==0.11.1
 xkit==0.0.0
 zipp==1.0.0
+africastalking==1.2.9

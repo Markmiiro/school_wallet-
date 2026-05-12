@@ -5,6 +5,9 @@ from typing import Any, Dict
 
 from app.database import get_db
 from app.models import Transaction, Wallet
+from app.sms import sms_topup_confirmation
+from app.models import Student, User
+
 
 router = APIRouter()
 
@@ -81,6 +84,25 @@ def flutterwave_webhook(
         wallet.balance += txn.amount
         txn.status = "completed"
         db.commit()
+            # ── SEND TOP-UP CONFIRMATION SMS ────────────
+    try:
+        student = db.query(Student).filter(
+            Student.id == wallet.student_id
+        ).first()
+        if student:
+            parent = db.query(User).filter(
+                User.id == student.parent_id
+            ).first()
+            if parent:
+                sms_topup_confirmation(
+                    parent_phone=parent.phone,
+                    student_name=student.name,
+                    amount=txn.amount,
+                    new_balance=wallet.balance,
+                )
+    except Exception as e:
+        print(f"⚠️  SMS notification failed: {e}")
+
 
         print(f"   ✅ Wallet credited UGX {txn.amount:,}")
         print(f"   New balance: UGX {wallet.balance:,}")
@@ -102,3 +124,4 @@ def flutterwave_webhook(
             "tx_ref": tx_ref,
             "note": "Wallet was not credited"
         }
+    
