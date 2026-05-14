@@ -82,3 +82,4 @@ xcffib==0.11.1
 xkit==0.0.0
 zipp==1.0.0
 africastalking==1.2.9
+python-multipart==0.0.9

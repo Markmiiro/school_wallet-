@@ -10,6 +10,8 @@ from app.routes import topup
 from app.routes import webhook
 from app.routes import merchants
 from app.routes import payments
+from app.routes import ussd
+
 
 
 # ── Create the app ──────────────────────────────
@@ -57,4 +59,5 @@ app.include_router(topup.router,    prefix="/topup",    tags=["Top-Up"])
 app.include_router(webhook.router, prefix="/webhook", tags=["Webhook"])
 app.include_router(merchants.router, prefix="/merchants", tags=["Merchants"])
 app.include_router(payments.router, prefix="/payments", tags=["Payments"])
+app.include_router(ussd.router, prefix="/ussd", tags=["USSD"])
 
