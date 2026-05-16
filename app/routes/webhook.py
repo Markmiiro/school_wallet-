@@ -4,39 +4,42 @@ from pydantic import BaseModel
 from typing import Any, Dict
 
 from app.database import get_db
-from app.models import Transaction, Wallet
+from app.models import Transaction, Wallet, Student, User
 from app.sms import sms_topup_confirmation
-from app.models import Student, User
-
 
 router = APIRouter()
 
 
-# ── Schema — tells Swagger UI what body to expect ──
 class WebhookPayload(BaseModel):
     event: str
     data: Dict[str, Any]
 
 
+# ================================================
+# POST /webhook/flutterwave
+# ------------------------------------------------
+# Works for both Flutterwave AND DGateway.
+# We keep the same endpoint name so your
+# existing tests still work.
+#
+# DGateway payload:
+# {
+#     "event": "charge.completed",
+#     "data": {
+#         "tx_ref": "your-reference-id",
+#         "status": "completed",
+#         "amount": 50000
+#     }
+# }
+# ================================================
 @router.post("/flutterwave")
-def flutterwave_webhook(
+def payment_webhook(
     payload: WebhookPayload,
     db: Session = Depends(get_db)
 ):
     """
-    Flutterwave calls this after every payment attempt.
-
+    Receives payment confirmation from DGateway.
     In test mode — call this manually to simulate approval.
-
-    Send this body to simulate a successful payment:
-    {
-        "event": "charge.completed",
-        "data": {
-            "tx_ref": "your-reference-id-here",
-            "status": "successful",
-            "amount": 50000
-        }
-    }
     """
 
     event = payload.event
@@ -70,9 +73,10 @@ def flutterwave_webhook(
     if txn.status != "pending":
         return {"message": f"Already processed — status is {txn.status}"}
 
-    # Credit or fail the wallet
-    if status == "successful":
+    # ── SUCCESSFUL PAYMENT ───────────────────────
+    if status == "completed":
 
+        # Find the wallet
         wallet = db.query(Wallet).filter(
             Wallet.id == txn.wallet_id
         ).first()
@@ -84,28 +88,28 @@ def flutterwave_webhook(
         wallet.balance += txn.amount
         txn.status = "completed"
         db.commit()
-            # ── SEND TOP-UP CONFIRMATION SMS ────────────
-    try:
-        student = db.query(Student).filter(
-            Student.id == wallet.student_id
-        ).first()
-        if student:
-            parent = db.query(User).filter(
-                User.id == student.parent_id
-            ).first()
-            if parent:
-                sms_topup_confirmation(
-                    parent_phone=parent.phone,
-                    student_name=student.name,
-                    amount=txn.amount,
-                    new_balance=wallet.balance,
-                )
-    except Exception as e:
-        print(f"⚠️  SMS notification failed: {e}")
-
 
         print(f"   ✅ Wallet credited UGX {txn.amount:,}")
         print(f"   New balance: UGX {wallet.balance:,}")
+
+        # ── SEND TOP-UP CONFIRMATION SMS ─────────
+        try:
+            student = db.query(Student).filter(
+                Student.id == wallet.student_id
+            ).first()
+            if student:
+                parent = db.query(User).filter(
+                    User.id == student.parent_id
+                ).first()
+                if parent:
+                    sms_topup_confirmation(
+                        parent_phone=parent.phone,
+                        student_name=student.name,
+                        amount=txn.amount,
+                        new_balance=wallet.balance,
+                    )
+        except Exception as e:
+            print(f"⚠️  SMS notification failed: {e}")
 
         return {
             "message": "Wallet credited successfully ✅",
@@ -115,13 +119,15 @@ def flutterwave_webhook(
             "currency": "UGX"
         }
 
+    # ── FAILED PAYMENT ───────────────────────────
     else:
         txn.status = "failed"
         db.commit()
+
+        print(f"   ❌ Payment failed: {status}")
 
         return {
             "message": "Payment failed ❌",
             "tx_ref": tx_ref,
             "note": "Wallet was not credited"
         }
-    
