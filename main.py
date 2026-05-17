@@ -11,6 +11,7 @@ from app.routes import webhook
 from app.routes import merchants
 from app.routes import payments
 from app.routes import ussd
+from app.routes import reports
 
 
 
@@ -51,13 +52,14 @@ def home():
 # Every router needs BOTH a prefix AND tags
 # prefix → sets the URL  e.g. /schools/
 # tags   → sets the label in Swagger UI
-app.include_router(schools.router,  prefix="/schools",  tags=["Schools"])
-app.include_router(users.router,    prefix="/users",    tags=["Users"])
-app.include_router(students.router, prefix="/students", tags=["Students"])
-app.include_router(wallets.router,  prefix="/wallets",  tags=["Wallets"])
-app.include_router(topup.router,    prefix="/topup",    tags=["Top-Up"])
-app.include_router(webhook.router, prefix="/webhook", tags=["Webhook"])
+app.include_router(schools.router,   prefix="/schools",   tags=["Schools"])
+app.include_router(users.router,     prefix="/users",     tags=["Users"])
+app.include_router(students.router,  prefix="/students",  tags=["Students"])
+app.include_router(wallets.router,   prefix="/wallets",   tags=["Wallets"])
+app.include_router(topup.router,     prefix="/topup",     tags=["Top-Up"])
+app.include_router(webhook.router,   prefix="/webhook",   tags=["Webhook"])
 app.include_router(merchants.router, prefix="/merchants", tags=["Merchants"])
-app.include_router(payments.router, prefix="/payments", tags=["Payments"])
-app.include_router(ussd.router, prefix="/ussd", tags=["USSD"])
+app.include_router(payments.router,  prefix="/payments",  tags=["Payments"])
+app.include_router(ussd.router,      prefix="/ussd",      tags=["USSD"])
+app.include_router(reports.router,   prefix="/reports",   tags=["Reports & Settlement"])
 
