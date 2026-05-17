@@ -99,9 +99,9 @@ class Merchant(Base):
     id         = Column(Integer, primary_key=True, index=True)
     name       = Column(String)
     school_id  = Column(Integer, ForeignKey("schools.id"))
-    momo_phone = Column(String, nullable=True)  # ← add this line
+    momo_phone = Column(String, nullable=True)
+    is_active  = Column(Boolean, default=True)       
     transactions = relationship("Transaction", back_populates="merchant")
-
 # PAYMENTS
 class Payment(Base):
     __tablename__ = "payments"

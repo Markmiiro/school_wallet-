@@ -73,3 +73,26 @@ def create_tables():
     from app import models  # noqa
     Base.metadata.create_all(bind=engine)
     print("✅ All tables created in PostgreSQL")
+
+    # Auto-add missing columns (works for both SQLite and PostgreSQL)
+    with engine.connect() as conn:
+        add_column_if_missing(conn, "merchants",    "is_active",   "BOOLEAN DEFAULT TRUE")
+        add_column_if_missing(conn, "wallets",      "daily_limit", "INTEGER DEFAULT 20000")
+        add_column_if_missing(conn, "transactions", "status",      "VARCHAR DEFAULT 'pending'")
+        add_column_if_missing(conn, "transactions", "reference",   "VARCHAR")
+        add_column_if_missing(conn, "transactions", "momo_phone",  "VARCHAR")
+        add_column_if_missing(conn, "transactions", "description", "VARCHAR")
+        conn.commit()
+    print("✅ All columns verified")
+
+
+def add_column_if_missing(conn, table: str, column: str, col_type: str):
+    """
+    Adds a column only if it does not already exist.
+    Works for both SQLite and PostgreSQL.
+    """
+    try:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+        print(f"   ➕ Added column: {table}.{column}")
+    except Exception:
+        pass  # Column already exists — skip silently
