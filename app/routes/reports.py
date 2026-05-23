@@ -20,6 +20,8 @@ from typing import Optional
 from app.database import get_db
 from app.models import Transaction, Wallet, Student, Merchant, School, User
 from app.momo import disburse_to_merchant
+from app.auth import get_current_admin
+from app.models import User
 
 router = APIRouter()
 
@@ -39,7 +41,9 @@ def merchant_daily_report(
         default=None,
         description="Date in YYYY-MM-DD format. Defaults to today."
     ),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+
 ):
     """
     Full daily sales report for a merchant.
@@ -176,7 +180,9 @@ def merchant_daily_report(
 @router.get("/merchant/{merchant_id}/dashboard")
 def merchant_dashboard(
     merchant_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+
 ):
     """
     Full merchant dashboard summary.
@@ -261,7 +267,9 @@ def school_settlement_report(
         default=None,
         description="Date in YYYY-MM-DD format. Defaults to today."
     ),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+
 ):
     """
     Full settlement report for school admin.
@@ -374,7 +382,10 @@ def school_settlement_report(
 async def trigger_manual_payout(
     school_id: int,
     report_date: Optional[str] = Query(default=None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+
+
 ):
     """
     Trigger end-of-day payout to all merchants.
@@ -488,7 +499,9 @@ async def trigger_manual_payout(
 @router.post("/settlements/auto")
 async def automated_daily_payout(
     secret: str = Query(..., description="Secret key to prevent unauthorized calls"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+
 ):
     """
     Automated end-of-day payout for ALL schools.

@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 from datetime import datetime, date, timedelta
 from typing import Optional
 import io
-
+from app.auth import get_current_user, get_current_admin
+from app.models import User
 from app.database import get_db
 from app.models import (
     Transaction, Wallet, Student,
@@ -79,7 +80,8 @@ def get_student_name(db: Session, wallet_id: int) -> str:
 @router.get("/school/{school_id}/overview")
 def school_overview(
     school_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
 ):
     """
     High level overview for headteacher.
@@ -198,7 +200,8 @@ def school_overview(
 def school_daily_breakdown(
     school_id: int,
     report_date: Optional[str] = Query(default=None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
 ):
     """
     Hour by hour breakdown of spending for a school.
@@ -259,7 +262,8 @@ def school_daily_breakdown(
 @router.get("/school/{school_id}/weekly")
 def school_weekly_trends(
     school_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
 ):
     """
     7-day spending trend for a school.
@@ -327,7 +331,8 @@ def school_weekly_trends(
 @router.get("/student/{student_id}/summary")
 def student_spending_summary(
     student_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
 ):
     """
     Full spending summary for one student.
@@ -419,7 +424,8 @@ def student_spending_summary(
 def export_to_excel(
     school_id: int,
     report_date: Optional[str] = Query(default=None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
 ):
     """
     Export school transactions to Excel.

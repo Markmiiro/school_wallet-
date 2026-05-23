@@ -24,6 +24,8 @@ import uuid
 from app.database import get_db
 from app.models import Transaction, Wallet, Student
 from app.momo import charge_mobile_money, verify_transaction
+from app.auth import get_current_user
+from app.models import User
 
 router = APIRouter()
 
@@ -86,7 +88,9 @@ class TopUpResponse(BaseModel):
 @router.post("/", response_model=TopUpResponse)
 async def initiate_topup(
     topup_data: TopUpRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← any logged in user
+
 ):
     """
     Initiate a wallet top-up via MTN or Airtel Money.
@@ -188,7 +192,9 @@ async def initiate_topup(
 @router.get("/{reference_id}")
 async def check_topup_status(
     reference_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← any logged in user
+
 ):
     """
     Check the current status of a top-up.
@@ -259,7 +265,9 @@ async def check_topup_status(
 def get_topup_history(
     wallet_id: int,
     limit: int = 10,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← any logged in user
+
 ):
     """Get all top-ups for a student's wallet. Newest first."""
     wallet = db.query(Wallet).filter(Wallet.id == wallet_id).first()

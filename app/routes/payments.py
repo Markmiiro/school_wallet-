@@ -6,6 +6,9 @@ from app.database import get_db
 from app.models import Wallet, Merchant, Transaction
 from app.sms import sms_payment_alert, sms_low_balance_alert
 from app.models import Student, User
+from app.auth import get_current_user
+from app.models import User
+
 router = APIRouter()
 
 
@@ -21,7 +24,8 @@ def make_payment(
     merchant_id: int,
     amount: int,
     description: str = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← add this
 ):
     """
     Student pays a merchant at the tuck shop.
@@ -181,7 +185,8 @@ def make_payment(
 @router.get("/merchant/{merchant_id}")
 def get_merchant_payments(
     merchant_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← add this
 ):
     """
     Get all payments received by a merchant.
@@ -234,7 +239,8 @@ def nfc_payment(
     merchant_id: int,
     amount: int,
     description: str = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← add this
 ):
     """
     Process a payment when a student taps their NFC bracelet.
@@ -392,7 +398,8 @@ def sync_offline_payments(
     payments: list[dict],
     merchant_id: int,
     device_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← add this
 ):
     """
     Receives a batch of offline payments from a tuck shop device.
