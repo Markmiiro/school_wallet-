@@ -82,6 +82,8 @@ def create_tables():
         add_column_if_missing(conn, "transactions", "reference",   "VARCHAR")
         add_column_if_missing(conn, "transactions", "momo_phone",  "VARCHAR")
         add_column_if_missing(conn, "transactions", "description", "VARCHAR")
+        add_column_if_missing(conn, "users", "pin_hash",  "VARCHAR")
+        add_column_if_missing(conn, "users", "school_id", "INTEGER")
         conn.commit()
     print("✅ All columns verified")
 

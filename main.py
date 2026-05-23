@@ -13,6 +13,7 @@ from app.routes import payments
 from app.routes import ussd
 from app.routes import reports
 from app.routes import analytics
+from app.routes import auth
 
 
 
@@ -65,3 +66,4 @@ app.include_router(payments.router,  prefix="/payments",  tags=["Payments"])
 app.include_router(ussd.router,      prefix="/ussd",      tags=["USSD"])
 app.include_router(reports.router,   prefix="/reports",   tags=["Reports & Settlement"])
 app.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
+app.include_router(auth.router, prefix="/auth", tags=["Authentication"])

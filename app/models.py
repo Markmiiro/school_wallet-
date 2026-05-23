@@ -8,14 +8,13 @@ from app.database import Base
 # USERS
 class User(Base):
     __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String)
-    phone = Column(String, unique=True)
-    role = Column(String)
-
+    id       = Column(Integer, primary_key=True, index=True)
+    name     = Column(String)
+    phone    = Column(String, unique=True)
+    role     = Column(String)
+    pin_hash = Column(String, nullable=True)  # ← add this line
+    school_id = Column(Integer, ForeignKey("schools.id"), nullable=True)
     students = relationship("Student", back_populates="parent")
-
 
 # SCHOOLS
 class School(Base):
