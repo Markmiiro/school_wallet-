@@ -21,17 +21,78 @@
 # Pending → 256111777781
 # ================================================
 
+# ================================================
+# app/momo.py
+# ------------------------------------------------
+# Payment gateway: Yo Uganda Limited
+# Licensed and Regulated by Bank of Uganda
+#
+# API format: XML over HTTP POST
+#
+# TWO MAIN OPERATIONS:
+# 1. charge_mobile_money → parent tops up wallet
+#    (acdepositfunds — asynchronous)
+#
+# 2. disburse_to_merchant → pay vendor at end of day
+#    (acwithdrawfunds)
+#
+# DOCS: https://payments.yo.co.ug
+# SANDBOX: https://sandbox.yo.co.ug
+# SUPPORT: support@yo.co.ug | +256 788 238665
+# ================================================
+
 import httpx
 import os
+import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DGATEWAY_API_URL = os.getenv("DGATEWAY_API_URL", "https://dgatewayapi.desispay.com")
-DGATEWAY_API_KEY = os.getenv("DGATEWAY_API_KEY", "")
-APP_ENV          = os.getenv("APP_ENV", "development")
+YO_USERNAME = os.getenv("YO_USERNAME", "")
+YO_PASSWORD = os.getenv("YO_PASSWORD", "")
+YO_API_URL  = os.getenv(
+    "YO_API_URL",
+    "https://sandbox.yo.co.ug/services/yopaymentsdev/"
+)
+YO_IPN_URL  = os.getenv(
+    "YO_IPN_URL",
+    "https://web-production-454a5.up.railway.app/webhook/yo"
+)
+APP_ENV = os.getenv("APP_ENV", "development")
 
 
+# ================================================
+# HELPER: Parse Yo Uganda XML response
+# ================================================
+def parse_yo_response(xml_text: str) -> dict:
+    """
+    Parse Yo Uganda XML response into a dict.
+
+    Yo Uganda returns XML like:
+    <AutoCreate>
+      <Response>
+        <Status>OK</Status>
+        <StatusCode>0</StatusCode>
+        <TransactionStatus>PENDING</TransactionStatus>
+        <TransactionReference>YO-REF-123</TransactionReference>
+      </Response>
+    </AutoCreate>
+    """
+    try:
+        root = ET.fromstring(xml_text)
+        result = {}
+        for child in root.iter():
+            if child.text and child.text.strip():
+                result[child.tag] = child.text.strip()
+        return result
+    except Exception as e:
+        print(f"XML parse error: {e}")
+        return {"Status": "ERROR", "StatusMessage": str(e)}
+
+
+# ================================================
+# MAIN FUNCTION 1: Charge parent's mobile money
+# ================================================
 async def charge_mobile_money(
     phone: str,
     amount: int,
@@ -40,162 +101,201 @@ async def charge_mobile_money(
     customer_name: str = "School Parent"
 ) -> dict:
     """
-    Sends a payment request to a parent's MTN or Airtel number.
+    Request payment from parent's MTN or Airtel wallet.
 
-    DGateway sends a USSD prompt to the parent's phone.
-    Parent enters their PIN to approve.
-    Poll verify_transaction() to check the result.
+    Uses Yo Uganda acdepositfunds (asynchronous).
+    Parent receives USSD prompt to approve with PIN.
+    Yo Uganda calls your /webhook/yo when approved.
 
     Args:
         phone         → e.g. "256771234567"
         amount        → in UGX e.g. 20000
-        network       → "MTN" or "AIRTEL" (informational only)
+        network       → "MTN" or "AIRTEL" (informational)
         tx_ref        → your unique reference ID
-        customer_name → parent's name
+        customer_name → parent name for the USSD prompt
 
     Returns:
-        dict → DGateway response with reference and status
+        dict with Status, TransactionReference, etc.
     """
 
-    # ── TEST MODE ──────────────────────────────────────────
-    # No API key set → simulate a successful payment
-    if not DGATEWAY_API_KEY or APP_ENV == "development":
-        print(f"\n🧪 TEST MODE — skipping real DGateway call")
-        print(f"   Phone:     {phone}")
-        print(f"   Amount:    UGX {amount:,}")
-        print(f"   Reference: {tx_ref}")
-        print(f"   Result:    FAKE SUCCESS ✅")
+    # ── TEST MODE ──────────────────────────────
+    if not YO_USERNAME or APP_ENV == "development":
+        print(f"\nTEST MODE — Yo Uganda fake charge")
+        print(f"  Phone:  {phone}")
+        print(f"  Amount: UGX {amount:,}")
+        print(f"  Ref:    {tx_ref}")
         return {
-            "data": {
-                "reference": tx_ref,
-                "status":    "pending",
-                "amount":    amount,
-                "currency":  "UGX",
-                "provider":  "iotec",
-            }
+            "Status":               "OK",
+            "StatusCode":           "0",
+            "TransactionStatus":    "PENDING",
+            "TransactionReference": tx_ref,
+            "StatusMessage":        "TEST MODE — auto approved",
         }
 
-    # ── PRODUCTION MODE ────────────────────────────────────
-    # Format phone — DGateway accepts 256XXXXXXXXX or 0XXXXXXXXX
+    # ── Format phone ────────────────────────────
     phone = phone.strip().replace("+", "").replace(" ", "")
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{DGATEWAY_API_URL}/v1/payments/collect",
-            headers={
-                "X-Api-Key":    DGATEWAY_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "amount":       amount,
-                "currency":     "UGX",
-                "phone_number": phone,
-                "provider":     "iotec",   # handles both MTN and Airtel in Uganda
-                "description":  f"School wallet top-up - {customer_name}",
-                "metadata": {
-                    "tx_ref":   tx_ref,
-                    "customer": customer_name,
-                    "network":  network,
-                }
-            },
-            timeout=30.0,
-        )
+    # ── Build XML request ────────────────────────
+    # Yo Uganda uses XML for all API calls
+    xml_request = f"""
+    <?xml version="1.0" encoding="UTF-8"?>
+    <AutoCreate>
+      <Request>
+        <APIUsername>{YO_USERNAME}</APIUsername>
+        <APIPassword>{YO_PASSWORD}</APIPassword>
+        <Method>acdepositfunds</Method>
+        <Amount>{amount}</Amount>
+        <Account>{phone}</Account>
+        <Currency>UGX</Currency>
+        <Narrative>School Wallet top-up for {customer_name}</Narrative>
+        <ExternalReference>{tx_ref}</ExternalReference>
+        <ProviderReferenceText>{tx_ref}</ProviderReferenceText>
+        <NonBlocking>TRUE</NonBlocking>
+        <InstantPaymentNotificationURL>{YO_IPN_URL}</InstantPaymentNotificationURL>
+      </Request>
+    </AutoCreate>
+    """.strip()
 
-    result = response.json()
+    # ── Send to Yo Uganda ────────────────────────
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                YO_API_URL,
+                content=xml_request,
+                headers={"Content-Type": "application/xml"},
+                timeout=30.0,
+            )
 
-    # DGateway returns data.reference — map it to our tx_ref format
-    if "data" in result and "reference" in result["data"]:
-        # Store DGateway's reference alongside our tx_ref
-        result["data"]["tx_ref"] = tx_ref
-        print(f"📡 DGateway charge initiated: {result['data'].get('status')} — ref: {result['data']['reference']}")
-    else:
-        print(f"⚠️  DGateway error: {result}")
+        result = parse_yo_response(response.text)
+        status = result.get("Status", "ERROR")
+        tx_status = result.get("TransactionStatus", "UNKNOWN")
 
-    return result
+        print(f"Yo Uganda charge: Status={status} TxStatus={tx_status} Ref={tx_ref}")
+        return result
 
-
-async def verify_transaction(reference: str) -> dict:
-    """
-    Check the current status of a payment by its reference.
-
-    Use this to poll for payment completion after calling
-    charge_mobile_money(). Poll every 5 seconds until
-    status is "completed" or "failed".
-
-    Args:
-        reference → DGateway reference from charge_mobile_money()
-
-    Returns:
-        dict → { data: { reference, status, amount, currency } }
-        status values: "pending" | "completed" | "failed"
-    """
-
-    # ── TEST MODE ──────────────────────────────────────────
-    if not DGATEWAY_API_KEY or APP_ENV == "development":
+    except Exception as e:
+        print(f"Yo Uganda error: {e}")
         return {
-            "data": {
-                "reference": reference,
-                "status":    "completed",
-                "amount":    0,
-                "currency":  "UGX",
-            }
+            "Status":        "ERROR",
+            "StatusMessage": str(e),
         }
 
-    # ── PRODUCTION MODE ────────────────────────────────────
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{DGATEWAY_API_URL}/v1/webhooks/verify",
-            headers={
-                "X-Api-Key":    DGATEWAY_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={"reference": reference},
-            timeout=30.0,
-        )
 
-    return response.json()
+# ================================================
+# MAIN FUNCTION 2: Check transaction status
+# ================================================
+async def verify_transaction(tx_ref: str) -> dict:
+    """
+    Check the current status of a transaction.
+
+    Uses Yo Uganda actransactioncheckstatus API.
+    Poll this every 15 seconds for pending transactions.
+
+    Status values from Yo Uganda:
+    PENDING       → waiting for parent to approve
+    SUCCEEDED     → payment confirmed
+    FAILED        → rejected or timed out
+    INDETERMINATE → unknown — check again later
+    """
+
+    # ── TEST MODE ──────────────────────────────
+    if not YO_USERNAME or APP_ENV == "development":
+        return {
+            "Status":            "OK",
+            "TransactionStatus": "SUCCEEDED",
+            "TransactionReference": tx_ref,
+        }
+
+    xml_request = f"""
+    <?xml version="1.0" encoding="UTF-8"?>
+    <AutoCreate>
+      <Request>
+        <APIUsername>{YO_USERNAME}</APIUsername>
+        <APIPassword>{YO_PASSWORD}</APIPassword>
+        <Method>actransactioncheckstatus</Method>
+        <PrivateTransactionReference>{tx_ref}</PrivateTransactionReference>
+      </Request>
+    </AutoCreate>
+    """.strip()
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                YO_API_URL,
+                content=xml_request,
+                headers={"Content-Type": "application/xml"},
+                timeout=30.0,
+            )
+        return parse_yo_response(response.text)
+    except Exception as e:
+        return {"Status": "ERROR", "StatusMessage": str(e)}
 
 
+# ================================================
+# MAIN FUNCTION 3: Pay vendor (end of day payout)
+# ================================================
 async def disburse_to_merchant(
     phone: str,
     amount: int,
     merchant_name: str = "Merchant"
 ) -> dict:
     """
-    Send money to a merchant's mobile money account.
-    Used for end-of-day vendor payouts.
+    Send end-of-day sales money to merchant's MoMo.
+
+    Uses Yo Uganda acwithdrawfunds API.
+    Money leaves your Yo Uganda float account
+    and goes to the merchant's MTN/Airtel wallet.
 
     Args:
-        phone         → merchant's MTN/Airtel number e.g. "256700000001"
-        amount        → amount in UGX
-        merchant_name → merchant's name for the payout note
+        phone         → merchant's MoMo e.g. "256700000001"
+        amount        → daily sales total in UGX
+        merchant_name → for the payment narrative
     """
 
-    # ── TEST MODE ──────────────────────────────────────────
-    if not DGATEWAY_API_KEY or APP_ENV == "development":
-        print(f"\n🧪 TEST MODE — fake payout to {phone} UGX {amount:,}")
-        return {"data": {"status": "completed", "amount": amount}}
+    # ── TEST MODE ──────────────────────────────
+    if not YO_USERNAME or APP_ENV == "development":
+        print(f"\nTEST MODE — Yo Uganda fake payout")
+        print(f"  Merchant: {merchant_name}")
+        print(f"  Phone:    {phone}")
+        print(f"  Amount:   UGX {amount:,}")
+        return {
+            "Status":            "OK",
+            "TransactionStatus": "SUCCEEDED",
+            "StatusMessage":     "TEST MODE — payout simulated",
+        }
 
-    # ── PRODUCTION MODE ────────────────────────────────────
     phone = phone.strip().replace("+", "").replace(" ", "")
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{DGATEWAY_API_URL}/v1/payments/disburse",
-            headers={
-                "X-Api-Key":    DGATEWAY_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "amount":           amount,
-                "currency":         "UGX",
-                "phone_number":     phone,
-                "provider":         "iotec",
-                "description":      f"Daily payout to {merchant_name}",
-            },
-            timeout=30.0,
-        )
+    import uuid
+    ext_ref = str(uuid.uuid4())
 
-    result = response.json()
-    print(f"💸 Payout to {merchant_name}: {result.get('data', {}).get('status')}")
-    return result
+    xml_request = f"""
+    <?xml version="1.0" encoding="UTF-8"?>
+    <AutoCreate>
+      <Request>
+        <APIUsername>{YO_USERNAME}</APIUsername>
+        <APIPassword>{YO_PASSWORD}</APIPassword>
+        <Method>acwithdrawfunds</Method>
+        <Amount>{amount}</Amount>
+        <Account>{phone}</Account>
+        <Currency>UGX</Currency>
+        <Narrative>Daily payout to {merchant_name}</Narrative>
+        <ExternalReference>{ext_ref}</ExternalReference>
+      </Request>
+    </AutoCreate>
+    """.strip()
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                YO_API_URL,
+                content=xml_request,
+                headers={"Content-Type": "application/xml"},
+                timeout=30.0,
+            )
+        result = parse_yo_response(response.text)
+        print(f"Yo Uganda payout: {result.get('Status')} — {merchant_name}")
+        return result
+    except Exception as e:
+        print(f"Yo Uganda payout error: {e}")
+        return {"Status": "ERROR", "StatusMessage": str(e)}

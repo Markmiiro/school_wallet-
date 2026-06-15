@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Any, Dict
+import xml.etree.ElementTree as ET
 
 from app.database import get_db
 from app.models import Transaction, Wallet, Student, User
@@ -16,83 +17,91 @@ class WebhookPayload(BaseModel):
 
 
 # ================================================
-# POST /webhook/flutterwave
+# POST /webhook/yo
 # ------------------------------------------------
-# Works for both Flutterwave AND DGateway.
-# We keep the same endpoint name so your
-# existing tests still work.
+# Yo Uganda calls this URL (IPN) after a parent
+# approves a top-up payment on their phone.
 #
-# DGateway payload:
-# {
-#     "event": "charge.completed",
-#     "data": {
-#         "tx_ref": "your-reference-id",
-#         "status": "completed",
-#         "amount": 50000
-#     }
-# }
+# Yo Uganda sends XML or form data with:
+#   ExternalReference  → your tx_ref (our UUID)
+#   TransactionStatus  → SUCCEEDED or FAILED
+#   Amount             → amount paid in UGX
+#
+# This endpoint must return 200 quickly.
+# Yo Uganda retries if it does not get 200.
 # ================================================
-@router.post("/flutterwave")
-def payment_webhook(
-    payload: WebhookPayload,
+
+@router.post("/yo")
+async def yo_uganda_webhook(
+    request: Request,
     db: Session = Depends(get_db)
 ):
-    """
-    Receives payment confirmation from DGateway.
-    In test mode — call this manually to simulate approval.
-    """
+    # ── Read raw body ─────────────────────────────
+    body      = await request.body()
+    body_text = body.decode("utf-8")
 
-    event = payload.event
-    data  = payload.data
+    print(f"\n[Yo Webhook] Received: {body_text[:200]}")
 
-    print(f"\n📩 Webhook received: event={event}")
+    tx_ref = None
+    status = None
+    amount = None
 
-    # Only handle charge completed events
-    if event != "charge.completed":
-        return {"message": f"Event '{event}' ignored"}
+    # ── Try XML first ─────────────────────────────
+    try:
+        root = ET.fromstring(body_text)
+        for child in root.iter():
+            if child.tag == "ExternalReference":
+                tx_ref = child.text
+            if child.tag == "TransactionStatus":
+                status = child.text
+            if child.tag == "Amount":
+                amount = child.text
+    except Exception:
+        # ── Fall back to form data ─────────────────
+        try:
+            form   = await request.form()
+            tx_ref = form.get("ExternalReference") or form.get("tx_ref")
+            status = form.get("TransactionStatus") or form.get("status")
+            amount = form.get("Amount") or form.get("amount")
+        except Exception as e:
+            print(f"[Yo Webhook] Could not parse body: {e}")
+            return {"message": "Could not parse request body"}
 
-    # Extract fields
-    tx_ref = data.get("tx_ref")
-    status = data.get("status")
+    print(f"[Yo Webhook] Ref={tx_ref} Status={status} Amount={amount}")
 
+    # ── Validate reference ────────────────────────
     if not tx_ref:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing tx_ref in webhook data"
-        )
+        return {"message": "No transaction reference found"}
 
-    # Find the matching transaction
+    # ── Find transaction ──────────────────────────
     txn = db.query(Transaction).filter(
         Transaction.reference == tx_ref
     ).first()
 
     if not txn:
-        return {"message": f"No transaction found for reference: {tx_ref}"}
+        # Return 200 so Yo Uganda stops retrying
+        return {"message": f"Transaction not found: {tx_ref}"}
 
-    # Idempotency — ignore if already processed
+    # ── Idempotency — never process twice ─────────
     if txn.status != "pending":
-        return {"message": f"Already processed — status is {txn.status}"}
+        return {"message": f"Already processed: {txn.status}"}
 
-    # ── SUCCESSFUL PAYMENT ───────────────────────
-    if status == "completed":
-
-        # Find the wallet
+    # ── SUCCEEDED → credit wallet ─────────────────
+    if status == "SUCCEEDED":
         wallet = db.query(Wallet).filter(
             Wallet.id == txn.wallet_id
         ).first()
 
         if not wallet:
-            raise HTTPException(status_code=404, detail="Wallet not found")
+            return {"message": "Wallet not found"}
 
-        # Credit the wallet
         wallet.balance += txn.amount
-        txn.status = "completed"
+        txn.status      = "completed"
         db.commit()
 
-        print(f"   ✅ Wallet credited UGX {txn.amount:,}")
-        print(f"   New balance: UGX {wallet.balance:,}")
+        print(f"[Yo Webhook] ✅ Wallet {wallet.id} credited UGX {txn.amount:,}")
 
-        # ── SEND TOP-UP CONFIRMATION SMS ─────────
+        # ── Send SMS to parent ─────────────────────
         try:
             student = db.query(Student).filter(
                 Student.id == wallet.student_id
@@ -101,7 +110,7 @@ def payment_webhook(
                 parent = db.query(User).filter(
                     User.id == student.parent_id
                 ).first()
-                if parent:
+                if parent and parent.phone:
                     sms_topup_confirmation(
                         parent_phone=parent.phone,
                         student_name=student.name,
@@ -109,25 +118,14 @@ def payment_webhook(
                         new_balance=wallet.balance,
                     )
         except Exception as e:
-            print(f"⚠️  SMS notification failed: {e}")
+            # SMS failure must never block wallet credit
+            print(f"[Yo Webhook] SMS error (non-fatal): {e}")
 
-        return {
-            "message": "Wallet credited successfully ✅",
-            "wallet_id": wallet.id,
-            "amount_credited": txn.amount,
-            "new_balance": wallet.balance,
-            "currency": "UGX"
-        }
+        return {"message": "Wallet credited successfully"}
 
-    # ── FAILED PAYMENT ───────────────────────────
+    # ── FAILED → mark failed ──────────────────────
     else:
         txn.status = "failed"
         db.commit()
-
-        print(f"   ❌ Payment failed: {status}")
-
-        return {
-            "message": "Payment failed ❌",
-            "tx_ref": tx_ref,
-            "note": "Wallet was not credited"
-        }
+        print(f"[Yo Webhook] ❌ Payment failed: {status} — Ref: {tx_ref}")
+        return {"message": f"Payment failed: {status}"}

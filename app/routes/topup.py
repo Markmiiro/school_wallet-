@@ -1,17 +1,17 @@
 # ================================================
 # routes/topup.py
 # ------------------------------------------------
-# Handles parent wallet top-ups via DGateway.
-# DGateway supports MTN MoMo and Airtel Uganda.
+# Handles parent wallet top-ups via Yo Uganda.
+# Yo Uganda supports MTN MoMo and Airtel Uganda.
 #
 # FLOW:
 # 1. Parent sends amount + phone + network + wallet_id
 # 2. Server validates everything
-# 3. Server calls DGateway to charge parent phone
-# 4. DGateway sends USSD prompt to parent
+# 3. Server calls Yo Uganda to charge parent phone
+# 4. Yo Uganda sends USSD prompt to parent
 # 5. Parent enters MoMo PIN to approve
-# 6. Poll /topup/{reference} to check status
-# 7. When completed → wallet is credited
+# 6. Yo Uganda calls /webhook/yo with result
+# 7. Webhook credits wallet and sends SMS to parent
 # ================================================
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,10 +22,9 @@ from datetime import datetime
 import uuid
 
 from app.database import get_db
-from app.models import Transaction, Wallet, Student
+from app.models import Transaction, Wallet, Student, User
 from app.momo import charge_mobile_money, verify_transaction
 from app.auth import get_current_user
-from app.models import User
 
 router = APIRouter()
 
@@ -89,16 +88,16 @@ class TopUpResponse(BaseModel):
 async def initiate_topup(
     topup_data: TopUpRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)  # ← any logged in user
-
+    current_user: User = Depends(get_current_user)
 ):
     """
     Initiate a wallet top-up via MTN or Airtel Money.
     Parent receives a USSD prompt to approve with their PIN.
-    Poll GET /topup/{reference_id} to check payment status.
+    Yo Uganda calls /webhook/yo when parent approves.
+    Wallet is credited automatically by the webhook.
     """
 
-    # ── Check wallet exists ─────────────────────────────────
+    # ── Check wallet exists ─────────────────────
     wallet = db.query(Wallet).filter(
         Wallet.id == topup_data.wallet_id
     ).first()
@@ -115,19 +114,21 @@ async def initiate_topup(
             detail="This wallet is deactivated. Contact school admin."
         )
 
-    # ── Get student name ────────────────────────────────────
+    # ── Get student name ────────────────────────
     student = db.query(Student).filter(
         Student.id == wallet.student_id
     ).first()
     student_name = student.name if student else "Student"
 
-    # ── Generate internal reference ID ─────────────────────
+    # ── Generate our reference ID ───────────────
+    # This UUID is sent to Yo Uganda as ExternalReference.
+    # Yo Uganda echoes it back in the webhook so we can
+    # match the payment to this transaction.
     our_ref = str(uuid.uuid4())
 
-    # ── Call DGateway ───────────────────────────────────────
-    # Do this BEFORE saving to DB so we get DGateway's reference
+    # ── Call Yo Uganda ──────────────────────────
     try:
-        dg_response = await charge_mobile_money(
+        yo_response = await charge_mobile_money(
             phone=topup_data.phone_number,
             amount=topup_data.amount,
             network=topup_data.network,
@@ -135,34 +136,41 @@ async def initiate_topup(
             customer_name=f"Parent of {student_name}",
         )
 
-        # Extract DGateway's reference from response
-        # In test mode this returns our_ref
-        # In production DGateway returns their own reference
-        dg_data = dg_response.get("data", {})
-        dg_reference = dg_data.get("reference", our_ref)
+        # Yo Uganda returns Status: OK on success
+        if yo_response.get("Status") != "OK":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Payment initiation failed: "
+                    f"{yo_response.get('StatusMessage', 'Unknown error from Yo Uganda')}"
+                )
+            )
 
-        print(f"\n💳 Top-up initiated:")
-        print(f"   Student:      {student_name}")
-        print(f"   Amount:       UGX {topup_data.amount:,}")
-        print(f"   Phone:        {topup_data.phone_number}")
-        print(f"   DG Reference: {dg_reference}")
+        print(f"\n💳 Top-up initiated via Yo Uganda:")
+        print(f"   Student:  {student_name}")
+        print(f"   Amount:   UGX {topup_data.amount:,}")
+        print(f"   Phone:    {topup_data.phone_number}")
+        print(f"   Our Ref:  {our_ref}")
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"   ❌ DGateway error: {str(e)}")
+        print(f"   ❌ Yo Uganda error: {str(e)}")
         raise HTTPException(
             status_code=503,
-            detail=f"Could not reach payment provider. Try again. Error: {str(e)}"
+            detail="Could not reach payment provider. Please try again."
         )
 
-    # ── Save PENDING transaction with DGateway's reference ──
-    # We save AFTER getting DGateway's reference
-    # so webhook can match by reference
+    # ── Save PENDING transaction ─────────────────
+    # We use our own UUID as the reference.
+    # The webhook matches on this same UUID.
+    # Wallet is NOT credited here — webhook does that.
     txn = Transaction(
         wallet_id=topup_data.wallet_id,
         amount=topup_data.amount,
         type="topup",
         status="pending",
-        reference=dg_reference,      # ← DGateway's reference
+        reference=our_ref,
         momo_phone=topup_data.phone_number,
         description=topup_data.note or f"Top-up for {student_name}",
     )
@@ -171,7 +179,7 @@ async def initiate_topup(
     db.refresh(txn)
 
     return TopUpResponse(
-        reference_id=dg_reference,
+        reference_id=our_ref,
         wallet_id=txn.wallet_id,
         amount=txn.amount,
         status="pending",
@@ -193,19 +201,19 @@ async def initiate_topup(
 async def check_topup_status(
     reference_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)  # ← any logged in user
-
+    current_user: User = Depends(get_current_user)
 ):
     """
     Check the current status of a top-up.
-    Also polls DGateway directly for latest status.
+    Also polls Yo Uganda directly if still pending.
 
     Returns:
     - pending   → parent has not approved yet
     - completed → wallet has been credited
     - failed    → rejected or timed out
     """
-    # Check our database first
+
+    # ── Check our database first ─────────────────
     txn = db.query(Transaction).filter(
         Transaction.reference == reference_id
     ).first()
@@ -216,17 +224,17 @@ async def check_topup_status(
             detail=f"No transaction found: {reference_id}"
         )
 
-    # If still pending — check DGateway for latest status
+    # ── If still pending — ask Yo Uganda ─────────
     if txn.status == "pending":
         try:
-            dg_status = await verify_transaction(reference_id)
-            latest_status = dg_status.get("data", {}).get("status", "pending")
+            yo_status = await verify_transaction(reference_id)
 
-            # DGateway uses "completed" — update our DB if changed
-            if latest_status == "completed" and txn.status != "completed":
-                from app.models import Wallet as WalletModel
-                wallet = db.query(WalletModel).filter(
-                    WalletModel.id == txn.wallet_id
+            # Yo Uganda uses SUCCEEDED (not "completed")
+            latest_status = yo_status.get("TransactionStatus", "INDETERMINATE")
+
+            if latest_status == "SUCCEEDED" and txn.status != "completed":
+                wallet = db.query(Wallet).filter(
+                    Wallet.id == txn.wallet_id
                 ).first()
                 if wallet:
                     wallet.balance += txn.amount
@@ -234,12 +242,13 @@ async def check_topup_status(
                 db.commit()
                 print(f"✅ Top-up confirmed via polling: {reference_id}")
 
-            elif latest_status == "failed" and txn.status != "failed":
+            # Yo Uganda uses FAILED (uppercase)
+            elif latest_status == "FAILED" and txn.status != "failed":
                 txn.status = "failed"
                 db.commit()
 
         except Exception as e:
-            print(f"⚠️  Could not poll DGateway: {e}")
+            print(f"⚠️  Could not poll Yo Uganda: {e}")
 
     status_messages = {
         "pending":   "Waiting for parent to approve on their phone",
@@ -266,13 +275,16 @@ def get_topup_history(
     wallet_id: int,
     limit: int = 10,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)  # ← any logged in user
-
+    current_user: User = Depends(get_current_user)
 ):
     """Get all top-ups for a student's wallet. Newest first."""
+
     wallet = db.query(Wallet).filter(Wallet.id == wallet_id).first()
     if not wallet:
-        raise HTTPException(status_code=404, detail=f"Wallet not found: {wallet_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Wallet not found: {wallet_id}"
+        )
 
     topups = (
         db.query(Transaction)
