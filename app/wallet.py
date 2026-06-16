@@ -3,115 +3,102 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Wallet, Transaction, Student
+from app.auth import get_current_user, get_current_admin
+from app.models import User
 
 router = APIRouter()
 
 
-# ================================================
-# GET /wallets/{student_id}
-# Get wallet for a specific student
-# ================================================
+# ── GET /wallets/{student_id} ─────────────────────
 @router.get("/{student_id}")
-def get_wallet(student_id: int, db: Session = Depends(get_db)):
-    """
-    Get the wallet belonging to a student.
-    Use the student ID — not the wallet ID.
-    Every student has exactly one wallet.
-    """
-    # Find the student first
+def get_wallet(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)  # ← add this
+):
+    """Get wallet for a student. Parent can only see their own child."""
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Student with ID {student_id} not found"
-        )
+        raise HTTPException(status_code=404, detail="Student not found")
 
-    # Find their wallet
-    wallet = db.query(Wallet).filter(
-        Wallet.student_id == student_id
-    ).first()
-    if not wallet:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No wallet found for student {student_id}"
-        )
-
-    return {
-        "wallet_id": wallet.id,
-        "student_id": student_id,
-        "student_name": student.name,
-        "balance": wallet.balance,
-        "currency": "UGX",
-        "is_active": wallet.is_active,
-    }
-
-
-# ================================================
-# GET /wallets/{student_id}/balance
-# Quick balance check
-# ================================================
-@router.get("/{student_id}/balance")
-def get_balance(student_id: int, db: Session = Depends(get_db)):
-    """
-    Quick balance check for a student's wallet.
-    Returns just the balance — nothing else.
-    Useful for the tuck shop screen showing
-    how much a student has before they buy.
-    """
-    wallet = db.query(Wallet).filter(
-        Wallet.student_id == student_id
-    ).first()
-    if not wallet:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No wallet found for student {student_id}"
-        )
-
-    # Block payment if wallet is deactivated
-    if not wallet.is_active:
+    # Parent can only see their own child's wallet
+    if current_user.role == "parent" and student.parent_id != current_user.id:
         raise HTTPException(
             status_code=403,
-            detail="This wallet is deactivated. Contact school admin."
+            detail="Access denied — this is not your child"
         )
 
+    wallet = db.query(Wallet).filter(
+        Wallet.student_id == student_id
+    ).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
     return {
-        "student_id": student_id,
-        "balance": wallet.balance,
-        "currency": "UGX",
-        "message": f"Available balance: UGX {wallet.balance:,}"
+        "student":    student.name,
+        "wallet_id":  wallet.id,
+        "balance":    wallet.balance,
+        "is_active":  wallet.is_active,
     }
 
 
-# ================================================
-# GET /wallets/{student_id}/history
-# Full transaction history for a wallet
-# ================================================
+# ── GET /wallets/{student_id}/balance ────────────
+@router.get("/{student_id}/balance")
+def get_balance(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Quick balance check. Parent can only check their own child."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    if current_user.role == "parent" and student.parent_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied — this is not your child"
+        )
+
+    wallet = db.query(Wallet).filter(
+        Wallet.student_id == student_id
+    ).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    return {
+        "student_id": student_id,
+        "balance":    wallet.balance,
+        "currency":   "UGX",
+        "message":    f"Available balance: UGX {wallet.balance:,}"
+    }
+
+
+# ── GET /wallets/{student_id}/history ────────────
 @router.get("/{student_id}/history")
 def get_transaction_history(
     student_id: int,
     limit: int = 20,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    """
-    Get all transactions for a student's wallet.
-    Ordered newest first.
-    limit → how many to return (default 20)
+    """Transaction history. Parent can only see their own child."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
 
-    Shows both:
-    - Top-ups (money coming IN)
-    - Payments (money going OUT)
-    """
-    # Find wallet
+    if current_user.role == "parent" and student.parent_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied — this is not your child"
+        )
+
     wallet = db.query(Wallet).filter(
         Wallet.student_id == student_id
     ).first()
     if not wallet:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No wallet found for student {student_id}"
-        )
+        raise HTTPException(status_code=404, detail="Wallet not found")
 
-    # Get transactions newest first
     transactions = (
         db.query(Transaction)
         .filter(Transaction.wallet_id == wallet.id)
@@ -120,179 +107,119 @@ def get_transaction_history(
         .all()
     )
 
-    # Calculate totals
-    total_topped_up = sum(
-        t.amount for t in transactions
-        if t.type == "topup" and t.status == "completed"
-    )
-    total_spent = sum(
-        t.amount for t in transactions
-        if t.type == "payment" and t.status == "completed"
-    )
+    total_in  = sum(t.amount for t in transactions if t.type == "topup" and t.status == "completed")
+    total_out = sum(t.amount for t in transactions if t.type == "payment" and t.status == "completed")
 
     return {
-        "student_id": student_id,
-        "wallet_id": wallet.id,
+        "student_id":      student_id,
+        "wallet_id":       wallet.id,
         "current_balance": wallet.balance,
-        "currency": "UGX",
+        "currency":        "UGX",
         "summary": {
-            "total_topped_up": total_topped_up,
-            "total_spent": total_spent,
-            "number_of_transactions": len(transactions),
+            "total_topped_up": total_in,
+            "total_spent":     total_out,
+            "num_transactions": len(transactions),
         },
         "transactions": [
             {
-                "id": t.id,
-                "type": t.type,            # "topup" or "payment"
-                "amount": t.amount,
-                "status": t.status,        # "pending", "completed", "failed"
-                "reference": t.reference,
+                "id":          t.id,
+                "type":        t.type,
+                "direction":   "⬆️ IN" if t.type == "topup" else "⬇️ OUT",
+                "amount":      t.amount,
+                "status":      t.status,
                 "description": t.description,
-                "date": t.timestamp,
-                # Show direction clearly for the parent
-                "direction": "⬆️ IN" if t.type == "topup" else "⬇️ OUT",
+                "date":        t.timestamp,
             }
             for t in transactions
         ]
     }
 
 
-# ================================================
-# PUT /wallets/{student_id}/limit
-# Parent sets daily spending limit
-# ================================================
+# ── PUT /wallets/{student_id}/limit ──────────────
 @router.put("/{student_id}/limit")
 def set_daily_limit(
     student_id: int,
     daily_limit: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    """
-    Parent sets how much their child can spend per day.
-    For example: UGX 15,000 per day maximum.
+    """Parent sets daily spending limit for their child."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
 
-    This protects against:
-    - Child buying too much junk food
-    - Wallet being used if bracelet is lost
-    """
-    # Validate the limit amount
+    # Only parent of this student or admin can set limit
+    if current_user.role == "parent" and student.parent_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied — this is not your child"
+        )
+
     if daily_limit <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Daily limit must be greater than 0"
-        )
-    if daily_limit > 500_000:
-        raise HTTPException(
-            status_code=400,
-            detail="Daily limit cannot exceed UGX 500,000"
-        )
+        raise HTTPException(status_code=400, detail="Daily limit must be greater than 0")
 
-    # Find wallet
     wallet = db.query(Wallet).filter(
         Wallet.student_id == student_id
     ).first()
     if not wallet:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No wallet found for student {student_id}"
-        )
+        raise HTTPException(status_code=404, detail="Wallet not found")
 
-    old_limit = wallet.daily_limit
+    old_limit      = wallet.daily_limit
     wallet.daily_limit = daily_limit
     db.commit()
 
     return {
-        "message": "Daily spending limit updated successfully",
-        "student_id": student_id,
+        "message":   "Daily limit updated ✅",
+        "student":   student.name,
         "old_limit": old_limit,
         "new_limit": daily_limit,
-        "currency": "UGX",
+        "currency":  "UGX",
     }
 
 
-# ================================================
-# PUT /wallets/{student_id}/deactivate
-# Deactivate a wallet (e.g. bracelet lost)
-# ================================================
+# ── PUT /wallets/{student_id}/deactivate ─────────
 @router.put("/{student_id}/deactivate")
 def deactivate_wallet(
     student_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)  # admins only
 ):
-    """
-    Deactivate a student's wallet.
-    Use this if:
-    - The NFC bracelet is lost
-    - The student has left the school
-    - There is suspicious activity
-
-    No payments can be made on a deactivated wallet.
-    The balance and history are preserved.
-    """
+    """Deactivate a student wallet. Admins only."""
     wallet = db.query(Wallet).filter(
         Wallet.student_id == student_id
     ).first()
     if not wallet:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No wallet found for student {student_id}"
-        )
-
-    if not wallet.is_active:
-        raise HTTPException(
-            status_code=400,
-            detail="Wallet is already deactivated"
-        )
+        raise HTTPException(status_code=404, detail="Wallet not found")
 
     wallet.is_active = False
     db.commit()
 
     return {
-        "message": "Wallet deactivated successfully",
-        "student_id": student_id,
-        "wallet_id": wallet.id,
+        "message":          "Wallet deactivated ✅",
+        "student_id":       student_id,
         "balance_preserved": wallet.balance,
-        "note": "Contact admin to reactivate"
     }
 
 
-# ================================================
-# PUT /wallets/{student_id}/reactivate
-# Reactivate a wallet (e.g. new bracelet issued)
-# ================================================
+# ── PUT /wallets/{student_id}/reactivate ─────────
 @router.put("/{student_id}/reactivate")
 def reactivate_wallet(
     student_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)  # admins only
 ):
-    """
-    Reactivate a previously deactivated wallet.
-    Use this when:
-    - A new NFC bracelet has been issued
-    - The suspension is lifted
-    """
+    """Reactivate a deactivated wallet. Admins only."""
     wallet = db.query(Wallet).filter(
         Wallet.student_id == student_id
     ).first()
     if not wallet:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No wallet found for student {student_id}"
-        )
-
-    if wallet.is_active:
-        raise HTTPException(
-            status_code=400,
-            detail="Wallet is already active"
-        )
+        raise HTTPException(status_code=404, detail="Wallet not found")
 
     wallet.is_active = True
     db.commit()
 
     return {
-        "message": "Wallet reactivated successfully",
+        "message":   "Wallet reactivated ✅",
         "student_id": student_id,
-        "wallet_id": wallet.id,
-        "balance": wallet.balance,
-        "note": "Student can now make payments again ✅"
+        "balance":   wallet.balance,
     }

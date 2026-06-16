@@ -1,98 +1,188 @@
-from datetime import datetime, timedelta
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+# ================================================
+# app/routes/auth.py
+# ------------------------------------------------
+# Authentication endpoints.
+#
+# LOGIN:    POST /auth/login    → phone + PIN → JWT
+# REGISTER: POST /auth/register → create user with PIN
+# ME:       GET  /auth/me       → who am I?
+#
+# All protected endpoints use Bearer token.
+# ================================================
+
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-import os
+from pydantic import BaseModel
 
 from app.database import get_db
+from app.models import User
+from app.auth import (
+    verify_pin,
+    hash_pin,
+    create_access_token,
+    get_current_user,
+)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-SECRET_KEY   = os.getenv("SECRET_KEY", "school_wallet_secret_change_this")
-ALGORITHM    = "HS256"
-EXPIRE_HOURS = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "24"))
-
-bearer_scheme = HTTPBearer()
-
-
-def hash_pin(pin: str) -> str:
-    return pwd_context.hash(pin)
+router = APIRouter()
 
 
-def verify_pin(plain_pin: str, hashed_pin: str) -> bool:
-    return pwd_context.verify(plain_pin, hashed_pin)
+# ── Schemas ───────────────────────────────────────
+class LoginRequest(BaseModel):
+    phone: str
+    pin: str
 
 
-def create_access_token(user_id: int, role: str, phone: str) -> str:
-    expire = datetime.utcnow() + timedelta(hours=EXPIRE_HOURS)
-    payload = {
-        "sub":   str(user_id),
-        "role":  role,
-        "phone": phone,
-        "exp":   expire,
+class RegisterRequest(BaseModel):
+    name: str
+    phone: str
+    role: str
+    pin: str
+
+
+# ════════════════════════════════════════════════
+# POST /auth/login
+# ════════════════════════════════════════════════
+@router.post("/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    """
+    Login with phone number + PIN.
+    Returns a JWT Bearer token for all protected endpoints.
+
+    Example:
+    {
+        "phone": "256760945424",
+        "pin":   "1234"
     }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    """
 
-
-def decode_token(token: str) -> dict:
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token. Please login again.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db)
-):
-    from app.models import User
-    token   = credentials.credentials
-    payload = decode_token(token)
-    user_id = payload.get("sub")
-
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
-
-    user = db.query(User).filter(User.id == int(user_id)).first()
+    # ── Find user ─────────────────────────────────
+    user = db.query(User).filter(User.phone == payload.phone).first()
 
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
+            status_code=401,
+            detail="Phone number not registered"
         )
 
-    return user
+    # ── Check PIN is set ──────────────────────────
+    if not user.pin_hash:
+        raise HTTPException(
+            status_code=401,
+            detail="No PIN set for this account. Contact admin."
+        )
+
+    # ── Verify PIN ────────────────────────────────
+    if not verify_pin(payload.pin, user.pin_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Wrong PIN. Please try again."
+        )
+
+    # ── Create token ──────────────────────────────
+    token = create_access_token(
+        user_id=user.id,
+        role=user.role,
+        phone=user.phone,
+    )
+
+    return {
+        "access_token": token,
+        "token_type":   "bearer",
+        "user": {
+            "id":    user.id,
+            "name":  user.name,
+            "phone": user.phone,
+            "role":  user.role,
+        },
+    }
 
 
-def get_current_parent(current_user=Depends(get_current_user)):
-    if current_user.role != "parent":
-        raise HTTPException(status_code=403, detail="Parents only")
-    return current_user
+# ════════════════════════════════════════════════
+# POST /auth/register
+# ════════════════════════════════════════════════
+@router.post("/register")
+def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    """
+    Register a new user with a PIN.
+
+    Role must be one of: parent | admin | merchant
+
+    Example:
+    {
+        "name":  "Mark Miiro",
+        "phone": "256760945424",
+        "role":  "admin",
+        "pin":   "1234"
+    }
+    """
+
+    # ── Validate role ─────────────────────────────
+    valid_roles = ["parent", "admin", "merchant"]
+    if payload.role not in valid_roles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Role must be one of: {valid_roles}"
+        )
+
+    # ── Check phone not already taken ─────────────
+    existing = db.query(User).filter(User.phone == payload.phone).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Phone {payload.phone} is already registered"
+        )
+
+    # ── Validate PIN ──────────────────────────────
+    if len(payload.pin) < 4:
+        raise HTTPException(
+            status_code=400,
+            detail="PIN must be at least 4 digits"
+        )
+
+    # ── Create user ───────────────────────────────
+    # pin_hash stores the bcrypt hash — never store plain PIN
+    user = User(
+        name=payload.name,
+        phone=payload.phone,
+        role=payload.role,
+        pin_hash=hash_pin(payload.pin),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    # ── Return token immediately ──────────────────
+    token = create_access_token(
+        user_id=user.id,
+        role=user.role,
+        phone=user.phone,
+    )
+
+    return {
+        "message":      "User registered successfully",
+        "access_token": token,
+        "token_type":   "bearer",
+        "user": {
+            "id":    user.id,
+            "name":  user.name,
+            "phone": user.phone,
+            "role":  user.role,
+        },
+    }
 
 
-def get_current_admin(current_user=Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
-    return current_user
-
-
-def get_current_merchant(current_user=Depends(get_current_user)):
-    if current_user.role != "merchant":
-        raise HTTPException(status_code=403, detail="Merchants only")
-    return current_user
-
-
-def get_admin_or_parent(current_user=Depends(get_current_user)):
-    if current_user.role not in ["admin", "parent"]:
-        raise HTTPException(status_code=403, detail="Admins and parents only")
-    return current_user
+# ════════════════════════════════════════════════
+# GET /auth/me
+# ════════════════════════════════════════════════
+@router.get("/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    """
+    Returns the currently logged-in user's profile.
+    Requires: Authorization: Bearer <token>
+    """
+    return {
+        "id":    current_user.id,
+        "name":  current_user.name,
+        "phone": current_user.phone,
+        "role":  current_user.role,
+    }
