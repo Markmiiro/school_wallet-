@@ -1,274 +1,204 @@
 # ================================================
 # app/sms.py
 # ------------------------------------------------
-# Production-ready SMS for Africa's Talking Uganda
+# SMS Gateway: Yo Uganda SMS Gateway
+# Endpoint: https://smgw1.yo.co.ug:8100/sendsms
+# Protocol: HTTP GET (URL params) — simpler than XML POST
 #
-# RULES FOR UGANDA SMS:
-# 1. Max 160 characters per SMS (plain text)
-# 2. No emojis (they reduce limit to 70 chars)
-# 3. No special Unicode characters
-# 4. Keep messages short and clear
-# 5. Always include school name for context
+# Default sender ID: 6969 (free, no monthly fee)
+# Custom sender ID : requires separate setup + MTN fee
+#
+# COST CONTROL STRATEGY (boarding school context):
+#   - Top-up confirmations  → send immediately (parent needs reassurance)
+#   - Purchase receipts     → batch at 6PM daily (see reports.py)
+#   - Low balance alerts    → send immediately (threshold: UGX 2,000)
+#   - Daily summary         → called from 6PM cron in reports.py
+#
+# ENV VARS REQUIRED:
+#   YO_SMS_ACCOUNT   → YBS account number (from Yo Uganda)
+#   YO_SMS_PASSWORD  → SMS gateway password (from Yo Uganda)
+#   YO_SMS_SENDER    → sender ID (default: 6969)
+#   YO_SMS_URL       → gateway URL (default: https://smgw1.yo.co.ug:8100/sendsms)
 # ================================================
 
 import os
-import africastalking
+import httpx
+import logging
+import urllib.parse
 from dotenv import load_dotenv
 
 load_dotenv()
 
-AT_USERNAME  = os.getenv("AT_USERNAME", "sandbox")
-AT_API_KEY   = os.getenv("AT_API_KEY", "")
-AT_SENDER_ID = os.getenv("AT_SENDER_ID", "SchoolWlt")
-APP_ENV      = os.getenv("APP_ENV", "development")
+logger = logging.getLogger(__name__)
 
-# ── Initialise Africa's Talking ──────────────────
-sms_client = None
+YO_SMS_ACCOUNT = os.getenv("YO_SMS_ACCOUNT", "")
+YO_SMS_PASSWORD = os.getenv("YO_SMS_PASSWORD", "")
+YO_SMS_SENDER   = os.getenv("YO_SMS_SENDER", "6969")
+YO_SMS_URL      = os.getenv("YO_SMS_URL", "https://smgw1.yo.co.ug:8100/sendsms")
+APP_ENV         = os.getenv("APP_ENV", "development")
 
-if AT_API_KEY:
-    try:
-        africastalking.initialize(AT_USERNAME, AT_API_KEY)
-        sms_client = africastalking.SMS
-        print(f"SMS ready — user: {AT_USERNAME}")
-    except Exception as e:
-        print(f"SMS init failed: {e}")
-else:
-    print("AT_API_KEY not set — SMS in print-only mode")
+# Yo Uganda numbers must be in full format: 256XXXXXXXXX
+def _clean_phone(phone: str) -> str:
+    phone = phone.strip().replace("+", "").replace(" ", "").replace("-", "")
+    if not phone.startswith("256"):
+        phone = "256" + phone.lstrip("0")
+    return phone
 
 
 # ================================================
 # CORE SEND FUNCTION
 # ================================================
-
-def send_sms(phone: str, message: str) -> bool:
+async def send_sms(phone: str, message: str) -> dict:
     """
-    Send an SMS to a Uganda phone number.
+    Send a single SMS via Yo Uganda SMS Gateway (HTTP GET).
 
-    NEVER crashes the app — always wrapped in try/except.
-    SMS failure should never block a payment.
+    Response from Yo Uganda is URL-encoded:
+        ybs_autocreate_status=OK
+        ybs_autocreate_status=ERROR&ybs_autocreate_message=...
 
     Args:
         phone   → Uganda number e.g. "256771234567"
-        message → Plain text, max 160 chars, no emojis
+        message → SMS content (160 chars per SMS segment)
+
+    Returns:
+        {"success": True/False, "message": "..."}
     """
-    # Format phone
-    phone = phone.strip().replace(" ", "").replace("+", "")
-    if not phone.startswith("256"):
-        print(f"Invalid phone: {phone}")
-        return False
+    phone = _clean_phone(phone)
 
-    # Add + prefix for AT
-    formatted = f"+{phone}"
+    # ── TEST MODE ─────────────────────────────────
+    if not YO_SMS_ACCOUNT or APP_ENV == "development":
+        print(f"\n[Yo SMS TEST] To: {phone}")
+        print(f"  Sender:  {YO_SMS_SENDER}")
+        print(f"  Message: {message}")
+        logger.info(f"[Yo SMS TEST] To: {phone} | {message[:60]}")
+        return {"success": True, "message": "TEST MODE — SMS not sent to real gateway"}
 
-    # Enforce 160 char limit
-    if len(message) > 160:
-        message = message[:157] + "..."
+    # ── Build request params ───────────────────────
+    params = {
+        "ybsacctno":    YO_SMS_ACCOUNT,
+        "password":     YO_SMS_PASSWORD,
+        "origin":       YO_SMS_SENDER,
+        "sms_content":  message,
+        "destinations": phone,
+    }
 
-    # Print-only mode (no API key or sandbox)
-    if not sms_client or AT_USERNAME == "sandbox":
-        print(f"\nSMS to {formatted}:")
-        print(f"  {message}")
-        print(f"  ({len(message)} chars)")
-        return True
-
-    # Send real SMS
+    # ── Send via HTTP GET ──────────────────────────
     try:
-        response = sms_client.send(
-            message=message,
-            recipients=[formatted],
-            sender_id=AT_SENDER_ID,
-        )
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                YO_SMS_URL,
+                params=params,
+                timeout=15.0,
+            )
 
-        recipients = response.get(
-            "SMSMessageData", {}
-        ).get("Recipients", [])
+        # Parse URL-encoded response body
+        # e.g. "ybs_autocreate_status=OK"
+        result = urllib.parse.parse_qs(response.text.strip())
+        status = result.get("ybs_autocreate_status", ["ERROR"])[0]
 
-        if recipients:
-            status = recipients[0].get("status", "")
-            cost   = recipients[0].get("cost", "")
-            if status == "Success":
-                print(f"SMS sent to {formatted} — cost: {cost}")
-                return True
-            else:
-                print(f"SMS failed: {status}")
-                return False
-        return False
+        if status == "OK":
+            logger.info(f"[Yo SMS] Sent ✓ to {phone}")
+            return {"success": True, "message": "SMS sent"}
+        else:
+            error_raw = result.get("ybs_autocreate_message", ["Unknown error"])[0]
+            # Yo returns + instead of spaces in error messages
+            error_msg = urllib.parse.unquote_plus(error_raw)
+            logger.error(f"[Yo SMS] Failed to {phone}: {error_msg}")
+            return {"success": False, "message": error_msg}
 
+    except httpx.TimeoutException:
+        logger.error(f"[Yo SMS] Timeout — could not reach gateway for {phone}")
+        return {"success": False, "message": "SMS gateway timeout"}
     except Exception as e:
-        print(f"SMS error: {e}")
-        return False
+        logger.error(f"[Yo SMS] Unexpected error: {e}")
+        return {"success": False, "message": str(e)}
 
 
 # ================================================
-# DETECT NETWORK FROM PHONE NUMBER
+# NAMED MESSAGE FUNCTIONS
+# Keep business logic out of route handlers.
+# All callers use these — never call send_sms directly from routes.
 # ================================================
 
-def detect_network(phone: str) -> str:
-    """
-    Detect MTN or Airtel from Uganda phone prefix.
-
-    MTN Uganda prefixes:   076, 077, 078, 039
-    Airtel Uganda prefixes: 070, 075, 074, 020
-    """
-    phone = phone.replace("+", "").replace(" ", "")
-    if phone.startswith("256"):
-        phone = phone[3:]  # remove country code
-
-    mtn_prefixes    = ["76", "77", "78", "39"]
-    airtel_prefixes = ["70", "75", "74", "20"]
-
-    for prefix in mtn_prefixes:
-        if phone.startswith(prefix):
-            return "MTN"
-
-    for prefix in airtel_prefixes:
-        if phone.startswith(prefix):
-            return "AIRTEL"
-
-    return "MTN"  # default
-
-
-# ================================================
-# SMS TEMPLATES
-# All messages:
-# - Max 160 characters
-# - No emojis
-# - No special characters
-# - Clear and simple
-# ================================================
-
-def sms_payment_alert(
-    parent_phone: str,
-    student_name: str,
-    amount: int,
-    merchant_name: str,
-    remaining_balance: int,
-    timestamp: str,
-) -> bool:
-    """
-    Alert parent when child makes a payment.
-
-    Example (98 chars):
-    SW: Amara spent UGX 2,000 at Main Canteen.
-    Balance: UGX 8,100. 19 May 10:02am
-    """
-    message = (
-        f"SW: {student_name} spent UGX {amount:,} "
-        f"at {merchant_name}. "
-        f"Balance: UGX {remaining_balance:,}. "
-        f"{timestamp}"
-    )
-    return send_sms(parent_phone, message)
-
-
-def sms_topup_confirmation(
+async def sms_topup_confirmation(
     parent_phone: str,
     student_name: str,
     amount: int,
     new_balance: int,
-) -> bool:
+) -> None:
     """
-    Confirm top-up to parent.
-
-    Example (75 chars):
-    SW: UGX 20,000 added to Amara's wallet.
-    New balance: UGX 20,000.
+    Immediate SMS after a successful top-up.
+    Called from routes/webhook.py when Yo Uganda IPN fires SUCCEEDED.
     """
     message = (
-        f"SW: UGX {amount:,} added to "
-        f"{student_name}'s wallet. "
+        f"School Wallet: UGX {amount:,} added for {student_name}. "
         f"New balance: UGX {new_balance:,}."
     )
-    return send_sms(parent_phone, message)
+    await send_sms(parent_phone, message)
 
 
-def sms_topup_failed(
-    parent_phone: str,
-    student_name: str,
-    amount: int,
-) -> bool:
-    """
-    Tell parent their top-up was rejected.
-
-    Example:
-    SW: Top-up of UGX 20,000 for Amara failed.
-    Please check your MoMo balance and try again.
-    """
-    message = (
-        f"SW: Top-up of UGX {amount:,} for "
-        f"{student_name} failed. "
-        f"Check your MoMo balance and try again."
-    )
-    return send_sms(parent_phone, message)
-
-
-def sms_low_balance_alert(
-    parent_phone: str,
-    student_name: str,
-    remaining_balance: int,
-) -> bool:
-    """
-    Warn parent when balance drops below UGX 2,000.
-
-    Example (84 chars):
-    SW: Low balance. Amara's wallet has UGX 800.
-    Top up now to avoid disruption.
-    """
-    message = (
-        f"SW: Low balance. "
-        f"{student_name}'s wallet has UGX {remaining_balance:,}. "
-        f"Top up now to avoid disruption."
-    )
-    return send_sms(parent_phone, message)
-
-
-def sms_wallet_deactivated(
-    parent_phone: str,
-    student_name: str,
-    reason: str = "Contact school admin",
-) -> bool:
-    """
-    Tell parent their child's wallet was deactivated.
-    """
-    message = (
-        f"SW: {student_name}'s wallet has been deactivated. "
-        f"{reason}."
-    )
-    return send_sms(parent_phone, message)
-
-
-def sms_daily_summary(
+async def sms_daily_summary(
     parent_phone: str,
     student_name: str,
     total_spent: int,
-    remaining_balance: int,
-    date: str,
-) -> bool:
+    purchase_count: int,
+    balance: int,
+) -> None:
     """
-    Daily spending summary sent to parent at end of day.
-    Optional — school can enable this feature.
+    6PM daily batch SMS — ONE message per active student per day.
+    Called from routes/reports.py 6PM cron job.
+    This is the primary cost-control mechanism: replaces per-purchase SMS.
     """
-    message = (
-        f"SW Daily Summary ({date}): "
-        f"{student_name} spent UGX {total_spent:,}. "
-        f"Balance: UGX {remaining_balance:,}."
-    )
-    return send_sms(parent_phone, message)
+    if purchase_count == 0:
+        message = (
+            f"School Wallet: {student_name} had no purchases today. "
+            f"Balance: UGX {balance:,}."
+        )
+    elif purchase_count == 1:
+        message = (
+            f"School Wallet: {student_name} spent UGX {total_spent:,} today "
+            f"(1 purchase). Balance: UGX {balance:,}."
+        )
+    else:
+        message = (
+            f"School Wallet: {student_name} spent UGX {total_spent:,} today "
+            f"({purchase_count} purchases). Balance: UGX {balance:,}."
+        )
+    await send_sms(parent_phone, message)
 
 
-def sms_welcome(
+async def sms_low_balance_alert(
     parent_phone: str,
-    parent_name: str,
     student_name: str,
-    ussd_code: str = "*384*23114#",
-) -> bool:
+    balance: int,
+) -> None:
     """
-    Welcome SMS sent when parent is first registered.
+    Immediate alert when student balance falls below UGX 2,000.
+    Does NOT wait for the 6PM batch — sent at purchase time.
     """
     message = (
-        f"Welcome to School Wallet, {parent_name}. "
-        f"{student_name} is registered. "
-        f"Top up by dialing {ussd_code} "
-        f"on any MTN or Airtel phone."
+        f"School Wallet: Low balance for {student_name}. "
+        f"Balance: UGX {balance:,}. "
+        f"Please top up to avoid disruption."
     )
-    return send_sms(parent_phone, message)
+    await send_sms(parent_phone, message)
+
+
+async def sms_payment_receipt(
+    parent_phone: str,
+    student_name: str,
+    amount: int,
+    vendor_name: str,
+    balance: int,
+) -> None:
+    """
+    Per-purchase receipt SMS.
+    WARNING: Use sparingly — each SMS costs UGX 35.
+    Default strategy: batch these into sms_daily_summary at 6PM.
+    Only call this directly if explicitly needed (e.g. amounts above UGX 10,000).
+    """
+    message = (
+        f"School Wallet: {student_name} paid UGX {amount:,} at {vendor_name}. "
+        f"Balance: UGX {balance:,}."
+    )
+    await send_sms(parent_phone, message)
