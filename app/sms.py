@@ -46,8 +46,58 @@ def _clean_phone(phone: str) -> str:
 
 
 # ================================================
-# CORE SEND FUNCTION
+# CORE SEND FUNCTIONS
+# Two versions exist on purpose:
+#   - send_sms()      → async, used by webhook.py (async def routes, awaited)
+#   - send_sms_sync() → sync,  used by payments.py (plain def routes, no await)
+# Both talk to the same Yo Uganda SMS Gateway endpoint.
 # ================================================
+def send_sms_sync(phone: str, message: str) -> dict:
+    """
+    Synchronous version of send_sms — for use inside plain `def` route
+    handlers (e.g. payments.py) that call SMS functions without `await`.
+    """
+    phone = _clean_phone(phone)
+
+    if not YO_SMS_ACCOUNT or APP_ENV == "development":
+        print(f"\n[Yo SMS TEST] To: {phone}")
+        print(f"  Sender:  {YO_SMS_SENDER}")
+        print(f"  Message: {message}")
+        logger.info(f"[Yo SMS TEST] To: {phone} | {message[:60]}")
+        return {"success": True, "message": "TEST MODE — SMS not sent to real gateway"}
+
+    params = {
+        "ybsacctno":    YO_SMS_ACCOUNT,
+        "password":     YO_SMS_PASSWORD,
+        "origin":       YO_SMS_SENDER,
+        "sms_content":  message,
+        "destinations": phone,
+    }
+
+    try:
+        with httpx.Client() as client:
+            response = client.get(YO_SMS_URL, params=params, timeout=15.0)
+
+        result = urllib.parse.parse_qs(response.text.strip())
+        status = result.get("ybs_autocreate_status", ["ERROR"])[0]
+
+        if status == "OK":
+            logger.info(f"[Yo SMS] Sent ✓ to {phone}")
+            return {"success": True, "message": "SMS sent"}
+        else:
+            error_raw = result.get("ybs_autocreate_message", ["Unknown error"])[0]
+            error_msg = urllib.parse.unquote_plus(error_raw)
+            logger.error(f"[Yo SMS] Failed to {phone}: {error_msg}")
+            return {"success": False, "message": error_msg}
+
+    except httpx.TimeoutException:
+        logger.error(f"[Yo SMS] Timeout — could not reach gateway for {phone}")
+        return {"success": False, "message": "SMS gateway timeout"}
+    except Exception as e:
+        logger.error(f"[Yo SMS] Unexpected error: {e}")
+        return {"success": False, "message": str(e)}
+
+
 async def send_sms(phone: str, message: str) -> dict:
     """
     Send a single SMS via Yo Uganda SMS Gateway (HTTP GET).
@@ -167,21 +217,45 @@ async def sms_daily_summary(
     await send_sms(parent_phone, message)
 
 
-async def sms_low_balance_alert(
+def sms_payment_alert(
     parent_phone: str,
     student_name: str,
-    balance: int,
+    amount: int,
+    merchant_name: str,
+    remaining_balance: int,
+    timestamp: str,
+) -> None:
+    """
+    Per-purchase SMS sent immediately after a tuck shop payment.
+    SYNC — called directly from payments.py's plain `def` routes
+    (make_payment, nfc_payment, sync_offline_payments), no await.
+
+    WARNING: Each SMS costs UGX 35. If purchase volume is high,
+    consider switching this to the 6PM batched sms_daily_summary
+    instead and dropping per-purchase alerts.
+    """
+    message = (
+        f"School Wallet: {student_name} paid UGX {amount:,} at {merchant_name} "
+        f"on {timestamp}. Balance: UGX {remaining_balance:,}."
+    )
+    send_sms_sync(parent_phone, message)
+
+
+def sms_low_balance_alert(
+    parent_phone: str,
+    student_name: str,
+    remaining_balance: int,
 ) -> None:
     """
     Immediate alert when student balance falls below UGX 2,000.
-    Does NOT wait for the 6PM batch — sent at purchase time.
+    SYNC — called directly from payments.py's plain `def` routes, no await.
     """
     message = (
         f"School Wallet: Low balance for {student_name}. "
-        f"Balance: UGX {balance:,}. "
+        f"Balance: UGX {remaining_balance:,}. "
         f"Please top up to avoid disruption."
     )
-    await send_sms(parent_phone, message)
+    send_sms_sync(parent_phone, message)
 
 
 async def sms_payment_receipt(
