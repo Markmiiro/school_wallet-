@@ -1,188 +1,117 @@
 # ================================================
-# app/routes/auth.py
+# app/auth.py
 # ------------------------------------------------
-# Authentication endpoints.
+# Authentication utilities — JWT creation/verification
+# and PIN hashing (bcrypt via passlib).
 #
-# LOGIN:    POST /auth/login    → phone + PIN → JWT
-# REGISTER: POST /auth/register → create user with PIN
-# ME:       GET  /auth/me       → who am I?
+# This file DEFINES the functions. It does NOT import
+# from app.routes.auth — that file imports FROM here.
 #
-# All protected endpoints use Bearer token.
+# Used by:
+#   app/routes/auth.py   → login, register, /me endpoints
+#   app/routes/*.py       → Depends(get_current_user) on protected routes
 # ================================================
 
-from fastapi import APIRouter, Depends, HTTPException
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
 
 from app.database import get_db
 from app.models import User
-from app.auth import (
-    verify_pin,
-    hash_pin,
-    create_access_token,
-    get_current_user,
-)
 
-router = APIRouter()
+# ── Config ────────────────────────────────────────
+SECRET_KEY              = os.getenv("SECRET_KEY", "")
+ALGORITHM                = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 24
 
-
-# ── Schemas ───────────────────────────────────────
-class LoginRequest(BaseModel):
-    phone: str
-    pin: str
-
-
-class RegisterRequest(BaseModel):
-    name: str
-    phone: str
-    role: str
-    pin: str
-
-
-# ════════════════════════════════════════════════
-# POST /auth/login
-# ════════════════════════════════════════════════
-@router.post("/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    """
-    Login with phone number + PIN.
-    Returns a JWT Bearer token for all protected endpoints.
-
-    Example:
-    {
-        "phone": "256760945424",
-        "pin":   "1234"
-    }
-    """
-
-    # ── Find user ─────────────────────────────────
-    user = db.query(User).filter(User.phone == payload.phone).first()
-
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="Phone number not registered"
-        )
-
-    # ── Check PIN is set ──────────────────────────
-    if not user.pin_hash:
-        raise HTTPException(
-            status_code=401,
-            detail="No PIN set for this account. Contact admin."
-        )
-
-    # ── Verify PIN ────────────────────────────────
-    if not verify_pin(payload.pin, user.pin_hash):
-        raise HTTPException(
-            status_code=401,
-            detail="Wrong PIN. Please try again."
-        )
-
-    # ── Create token ──────────────────────────────
-    token = create_access_token(
-        user_id=user.id,
-        role=user.role,
-        phone=user.phone,
+if not SECRET_KEY:
+    # Fail loudly rather than silently signing tokens with an empty key
+    raise RuntimeError(
+        "SECRET_KEY environment variable is not set. "
+        "Set it in Railway → Variables before starting the app."
     )
 
-    return {
-        "access_token": token,
-        "token_type":   "bearer",
-        "user": {
-            "id":    user.id,
-            "name":  user.name,
-            "phone": user.phone,
-            "role":  user.role,
-        },
-    }
+# ── PIN hashing context (bcrypt) ───────────────────
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# ── OAuth2 scheme — tells FastAPI where to find the login endpoint ──
+# tokenUrl is just used for the Swagger UI "Authorize" button.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 
-# ════════════════════════════════════════════════
-# POST /auth/register
-# ════════════════════════════════════════════════
-@router.post("/register")
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+# ================================================
+# PIN HASHING
+# ================================================
+def hash_pin(pin: str) -> str:
+    """Hash a plaintext PIN for storage in User.pin_hash."""
+    return pwd_context.hash(pin)
+
+
+def verify_pin(plain_pin: str, hashed_pin: str) -> bool:
+    """Check a plaintext PIN against the stored bcrypt hash."""
+    if not hashed_pin:
+        return False
+    return pwd_context.verify(plain_pin, hashed_pin)
+
+
+# ================================================
+# JWT TOKEN CREATION
+# ================================================
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """
-    Register a new user with a PIN.
+    Create a signed JWT.
 
-    Role must be one of: parent | admin | merchant
-
-    Example:
-    {
-        "name":  "Mark Miiro",
-        "phone": "256760945424",
-        "role":  "admin",
-        "pin":   "1234"
-    }
+    `data` should contain at least {"sub": user.phone} so we can
+    look the user back up on every protected request.
     """
-
-    # ── Validate role ─────────────────────────────
-    valid_roles = ["parent", "admin", "merchant"]
-    if payload.role not in valid_roles:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Role must be one of: {valid_roles}"
-        )
-
-    # ── Check phone not already taken ─────────────
-    existing = db.query(User).filter(User.phone == payload.phone).first()
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Phone {payload.phone} is already registered"
-        )
-
-    # ── Validate PIN ──────────────────────────────
-    if len(payload.pin) < 4:
-        raise HTTPException(
-            status_code=400,
-            detail="PIN must be at least 4 digits"
-        )
-
-    # ── Create user ───────────────────────────────
-    # pin_hash stores the bcrypt hash — never store plain PIN
-    user = User(
-        name=payload.name,
-        phone=payload.phone,
-        role=payload.role,
-        pin_hash=hash_pin(payload.pin),
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (
+        expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-    # ── Return token immediately ──────────────────
-    token = create_access_token(
-        user_id=user.id,
-        role=user.role,
-        phone=user.phone,
+
+# ================================================
+# GET CURRENT USER (dependency for protected routes)
+# ================================================
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Decode the JWT from the Authorization header, look up the user,
+    and return it. Raises 401 if the token is invalid/expired or the
+    user no longer exists.
+
+    Usage in any route:
+        from app.auth import get_current_user
+        @router.get("/protected")
+        def protected_route(current_user: User = Depends(get_current_user)):
+            ...
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
     )
 
-    return {
-        "message":      "User registered successfully",
-        "access_token": token,
-        "token_type":   "bearer",
-        "user": {
-            "id":    user.id,
-            "name":  user.name,
-            "phone": user.phone,
-            "role":  user.role,
-        },
-    }
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        phone: str = payload.get("sub")
+        if phone is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
 
+    user = db.query(User).filter(User.phone == phone).first()
+    if user is None:
+        raise credentials_exception
 
-# ════════════════════════════════════════════════
-# GET /auth/me
-# ════════════════════════════════════════════════
-@router.get("/me")
-def get_me(current_user: User = Depends(get_current_user)):
-    """
-    Returns the currently logged-in user's profile.
-    Requires: Authorization: Bearer <token>
-    """
-    return {
-        "id":    current_user.id,
-        "name":  current_user.name,
-        "phone": current_user.phone,
-        "role":  current_user.role,
-    }
+    return user
