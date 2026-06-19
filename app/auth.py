@@ -115,3 +115,28 @@ def get_current_user(
         raise credentials_exception
 
     return user
+
+
+# ================================================
+# GET CURRENT ADMIN (dependency for admin-only routes)
+# ================================================
+def get_current_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """
+    Builds on get_current_user — requires a valid token AND that the
+    user's role is "admin". Raises 403 if the user is logged in but
+    not an admin (e.g. parent or merchant).
+
+    Usage in any route:
+        from app.auth import get_current_admin
+        @router.get("/admin-only")
+        def admin_route(current_admin: User = Depends(get_current_admin)):
+            ...
+    """
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action requires admin privileges.",
+        )
+    return current_user
