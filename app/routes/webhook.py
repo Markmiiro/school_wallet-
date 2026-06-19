@@ -59,18 +59,39 @@ async def yo_uganda_webhook(
     status = None
     amount = None
 
-    # ── Try XML first ─────────────────────────────
-    try:
-        root = ET.fromstring(body_text)
-        for child in root.iter():
-            if child.tag == "ExternalReference":
-                tx_ref = child.text
-            if child.tag == "TransactionStatus":
-                status = child.text
-            if child.tag == "Amount":
-                amount = child.text
-    except Exception:
-        # ── Fall back to form data ─────────────────
+    # ── Try JSON first (easiest to test with curl, and some IPN
+    #    configurations may send JSON depending on setup) ──────
+    content_type = request.headers.get("content-type", "")
+    parsed = False
+
+    if "application/json" in content_type:
+        try:
+            import json
+            data = json.loads(body_text)
+            tx_ref = data.get("ExternalReference") or data.get("tx_ref")
+            status = data.get("TransactionStatus") or data.get("status")
+            amount = data.get("Amount") or data.get("amount")
+            parsed = True
+        except Exception as e:
+            print(f"[Yo Webhook] JSON parse attempt failed: {e}")
+
+    # ── Try XML (Yo Uganda's real IPN format) ─────
+    if not parsed:
+        try:
+            root = ET.fromstring(body_text)
+            for child in root.iter():
+                if child.tag == "ExternalReference":
+                    tx_ref = child.text
+                if child.tag == "TransactionStatus":
+                    status = child.text
+                if child.tag == "Amount":
+                    amount = child.text
+            parsed = True
+        except Exception:
+            pass
+
+    # ── Fall back to form data ────────────────────
+    if not parsed:
         try:
             form   = await request.form()
             tx_ref = form.get("ExternalReference") or form.get("tx_ref")
