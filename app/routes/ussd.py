@@ -161,6 +161,18 @@ def validate_amount(raw: str) -> Optional[int]:
     return amount
 
 
+def find_student_by_account_number(db: Session, account_number: str):
+    """
+    Look up a student by their 12-digit account_number
+    (format: {3-digit school code}{9 random digits}).
+    Returns the Student, or None if not found / input is malformed.
+    """
+    if not account_number:
+        return None
+    cleaned = account_number.strip().replace(" ", "")
+    return db.query(Student).filter(Student.account_number == cleaned).first()
+
+
 def build_single_amount_product(student_id: int, amount: int) -> dict:
     """
     Build a single_step_product with ONE item whose amount matches
@@ -278,12 +290,7 @@ async def yo_ussd_callout(
                             f"UGX {MIN_TOPUP:,} and UGX {MAX_TOPUP:,}.",
             }
 
-        try:
-            sid = int(account_number)
-        except (ValueError, TypeError):
-            return {"validated": False, "message": "Invalid account number."}
-
-        student = db.query(Student).filter(Student.id == sid).first()
+        student = find_student_by_account_number(db, account_number)
         if not student:
             return {"validated": False, "message": "Student not found."}
 
@@ -309,12 +316,7 @@ async def yo_ussd_callout(
                             f"UGX {MIN_TOPUP:,} and UGX {MAX_TOPUP:,}.",
             }
 
-        try:
-            sid = int(account_number)
-        except (ValueError, TypeError):
-            return {"validated": False, "message": "Invalid account number."}
-
-        student = db.query(Student).filter(Student.id == sid).first()
+        student = find_student_by_account_number(db, account_number)
         if not student:
             return {"validated": False, "message": "Student not found."}
 
@@ -331,14 +333,9 @@ async def yo_ussd_callout(
     # Identify student, show personalized menu.
     # ──────────────────────────────────────────────
     if account_number is not None:
-        try:
-            sid = int(account_number)
-        except (ValueError, TypeError):
-            return {"validated": False, "message": "Invalid account number. Please check and try again."}
-
-        student = db.query(Student).filter(Student.id == sid).first()
+        student = find_student_by_account_number(db, account_number)
         if not student:
-            return {"validated": False, "message": f"Account {sid} not found. Please check with the school."}
+            return {"validated": False, "message": f"Account {account_number} not found. Please check with the school."}
 
         wallet = db.query(Wallet).filter(Wallet.student_id == student.id).first()
         if not wallet or not wallet.is_active:

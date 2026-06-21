@@ -48,10 +48,16 @@ class School(Base):
 class Student(Base):
     __tablename__ = "students"
 
-    id        = Column(Integer, primary_key=True, index=True)
-    name      = Column(String, nullable=False)
-    school_id = Column(Integer, ForeignKey("schools.id"), nullable=False)
-    parent_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # account_number: 12-digit parent-facing identifier, structured as
+    # {3-digit school code}{9 random digits} e.g. "003482917604".
+    # Generated at registration — see app/account_number.py.
+    # Nullable so existing students (created before this field existed)
+    # don't break; backfill separately if needed.
+    id             = Column(Integer, primary_key=True, index=True)
+    name           = Column(String, nullable=False)
+    school_id      = Column(Integer, ForeignKey("schools.id"), nullable=False)
+    parent_id      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    account_number = Column(String, unique=True, nullable=True, index=True)
 
     # Relationships
     school  = relationship("School", back_populates="students")

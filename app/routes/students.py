@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Student, Wallet, NFCTag, School, User
+from app.account_number import generate_account_number
 
 router = APIRouter()
 
@@ -10,7 +11,7 @@ router = APIRouter()
 # ================================================
 # POST /students/
 # Create a new student
-# Auto creates wallet + NFC slot
+# Auto creates wallet + NFC slot + account number
 # ================================================
 @router.post("/")
 def create_student(
@@ -19,7 +20,9 @@ def create_student(
     parent_id: int,
     db: Session = Depends(get_db)
 ):
-    """Register a new student. Automatically creates their wallet and NFC tag slot."""
+    """Register a new student. Automatically creates their wallet,
+    an empty NFC tag slot (filled in later via /assign-nfc), and a
+    parent-facing account number."""
 
     # Check school exists
     school = db.query(School).filter(School.id == school_id).first()
@@ -40,6 +43,9 @@ def create_student(
     db.add(student)
     db.flush()  # get student.id before committing
 
+    # Generate the parent-facing account number now that we have student.id
+    student.account_number = generate_account_number(db, school_id)
+
     # Auto create wallet — starts at zero balance
     wallet = Wallet(
         student_id=student.id,
@@ -49,7 +55,6 @@ def create_student(
     db.add(wallet)
 
     # Auto create NFC slot — no bracelet assigned yet
-    # NOTE: no is_active on NFCTag — your model does not have it
     nfc_tag = NFCTag(
         student_id=student.id,
         tag_uid=None,
@@ -67,6 +72,7 @@ def create_student(
             "name": student.name,
             "school_id": student.school_id,
             "parent_id": student.parent_id,
+            "account_number": student.account_number,
         },
         "wallet": {
             "id": wallet.id,
@@ -167,6 +173,9 @@ def get_students_by_parent(parent_id: int, db: Session = Depends(get_db)):
 # ================================================
 # PUT /students/{student_id}/assign-nfc
 # Assign a physical NFC bracelet to a student
+# (Manual override / fallback path — used when a student's tag
+#  was created as an empty placeholder because stock was empty
+#  at registration time, or to fix/replace a tag later.)
 # ================================================
 @router.put("/{student_id}/assign-nfc")
 def assign_nfc_tag(
@@ -185,7 +194,7 @@ def assign_nfc_tag(
 
     # Check this tag is not already used by someone else
     already_used = db.query(NFCTag).filter(NFCTag.tag_uid == tag_uid).first()
-    if already_used:
+    if already_used and already_used.student_id != student_id:
         raise HTTPException(
             status_code=400,
             detail=f"NFC tag {tag_uid} is already assigned to another student"
