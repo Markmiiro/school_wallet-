@@ -63,14 +63,26 @@ def verify_pin(plain_pin: str, hashed_pin: str) -> bool:
 # ================================================
 # JWT TOKEN CREATION
 # ================================================
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(
+    user_id: int,
+    role: str,
+    phone: str,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
     """
     Create a signed JWT.
 
-    `data` should contain at least {"sub": user.phone} so we can
-    look the user back up on every protected request.
+    Called from app/routes/auth.py as:
+        create_access_token(user_id=user.id, role=user.role, phone=user.phone)
+
+    "sub" is set to phone so get_current_user() can look the user
+    back up on every protected request via User.phone.
     """
-    to_encode = data.copy()
+    to_encode = {
+        "sub": phone,
+        "user_id": user_id,
+        "role": role,
+    }
     expire = datetime.utcnow() + (
         expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     )
