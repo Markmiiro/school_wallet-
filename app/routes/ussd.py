@@ -361,7 +361,6 @@ async def yo_ussd_callout(
                 f"Student Name: {student.name}\n"
                 f"Class: {getattr(student, 'class_name', 'N/A')}\n"
                 f"School: {student.school.name}\n"
-                f"1. Top up\n00. Cancel"
             ),
         }
 
