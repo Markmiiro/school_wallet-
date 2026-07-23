@@ -8,6 +8,39 @@ from app.account_number import generate_account_number
 router = APIRouter()
 
 
+# ────────────────────────────────────────────────
+# Helper — build a consistent student payload.
+# Includes school name, account number, and NFC
+# card status so the mobile app can display them
+# without extra round trips.
+# ────────────────────────────────────────────────
+def student_payload(student: Student) -> dict:
+    nfc = student.nfc_tag
+
+    if nfc is None:
+        nfc_status = "no card slot"
+        tag_uid = None
+    elif nfc.tag_uid:
+        nfc_status = "assigned" if nfc.is_active else "inactive"
+        tag_uid = nfc.tag_uid
+    else:
+        nfc_status = "not assigned"
+        tag_uid = None
+
+    return {
+        "id": student.id,
+        "name": student.name,
+        "school_id": student.school_id,
+        "school_name": student.school.name if student.school else None,
+        "parent_id": student.parent_id,
+        "account_number": student.account_number,
+        "nfc": {
+            "tag_uid": tag_uid,
+            "status": nfc_status,
+        },
+    }
+
+
 # ================================================
 # POST /students/
 # Create a new student
@@ -71,6 +104,7 @@ def create_student(
             "id": student.id,
             "name": student.name,
             "school_id": student.school_id,
+            "school_name": school.name,
             "parent_id": student.parent_id,
             "account_number": student.account_number,
         },
@@ -78,10 +112,11 @@ def create_student(
             "id": wallet.id,
             "balance": wallet.balance,
             "is_active": wallet.is_active,
+            "daily_limit": wallet.daily_limit,
         },
         "nfc_tag": {
             "tag_uid": nfc_tag.tag_uid,
-            "status": "no bracelet assigned yet"
+            "status": "not assigned"
         }
     }
 
@@ -94,20 +129,13 @@ def create_student(
 def get_all_students(db: Session = Depends(get_db)):
     """Get all students in the system."""
     students = db.query(Student).all()
-    return [
-        {
-            "id": s.id,
-            "name": s.name,
-            "school_id": s.school_id,
-            "parent_id": s.parent_id,
-        }
-        for s in students
-    ]
+    return [student_payload(s) for s in students]
 
 
 # ================================================
 # GET /students/{student_id}
 # Get ONE student by their ID
+# Now includes school name, account number, and NFC status.
 # ================================================
 @router.get("/{student_id}")
 def get_student(student_id: int, db: Session = Depends(get_db)):
@@ -118,12 +146,7 @@ def get_student(student_id: int, db: Session = Depends(get_db)):
             status_code=404,
             detail=f"Student with ID {student_id} not found"
         )
-    return {
-        "id": student.id,
-        "name": student.name,
-        "school_id": student.school_id,
-        "parent_id": student.parent_id,
-    }
+    return student_payload(student)
 
 
 # ================================================
@@ -141,16 +164,15 @@ def get_students_by_school(school_id: int, db: Session = Depends(get_db)):
     return {
         "school": school.name,
         "total_students": len(students),
-        "students": [
-            {"id": s.id, "name": s.name, "parent_id": s.parent_id}
-            for s in students
-        ]
+        "students": [student_payload(s) for s in students]
     }
 
 
 # ================================================
 # GET /students/parent/{parent_id}
 # Get all students under one parent
+# Now includes school name, account number, and NFC status
+# so the app's dashboard and card screens can show them.
 # ================================================
 @router.get("/parent/{parent_id}")
 def get_students_by_parent(parent_id: int, db: Session = Depends(get_db)):
@@ -163,10 +185,7 @@ def get_students_by_parent(parent_id: int, db: Session = Depends(get_db)):
     return {
         "parent": parent.name,
         "total_children": len(students),
-        "students": [
-            {"id": s.id, "name": s.name, "school_id": s.school_id}
-            for s in students
-        ]
+        "students": [student_payload(s) for s in students]
     }
 
 
@@ -213,7 +232,7 @@ def assign_nfc_tag(
         "student_id": student_id,
         "student_name": student.name,
         "tag_uid": tag_uid,
-        "status": "ready to tap and pay ✅"
+        "status": "assigned"
     }
 
 
