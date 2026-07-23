@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Wallet, Transaction,Student
+from app.models import Wallet, Transaction, Student
 
 router = APIRouter()
 
@@ -17,6 +17,12 @@ router = APIRouter()
 #
 # Meaning:
 # "Show me the wallet for student ID 1"
+#
+# NOTE: this route is written as "/wallets/{student_id}" AND the router
+# is mounted with prefix="/wallets" in main.py, so the live path is
+# actually /wallets/wallets/{student_id}. This is a known quirk. The
+# Flutter app depends on it — do NOT "fix" the path here without
+# updating the app's ApiConstants at the same time, or the app breaks.
 # ==========================================
 
 @router.get("/wallets/{student_id}")
@@ -51,7 +57,8 @@ def get_wallet(
         "student": student.name,
         "wallet_id": wallet.id,
         "balance": wallet.balance,
-        "is_active": wallet.is_active
+        "is_active": wallet.is_active,
+        "daily_limit": wallet.daily_limit,
     }
 
 # ================================================
@@ -102,6 +109,7 @@ def get_transaction_history(
         "student_id": student_id,
         "wallet_id": wallet.id,
         "current_balance": wallet.balance,
+        "daily_limit": wallet.daily_limit,
         "currency": "UGX",
         "summary": {
             "total_topped_up": total_in,
@@ -112,7 +120,9 @@ def get_transaction_history(
             {
                 "id": t.id,
                 "type": t.type,
-                "direction": "⬆️ IN" if t.type == "topup" else "⬇️ OUT",
+                # Plain "IN"/"OUT" (no emoji arrows) — cleaner for the
+                # app to parse. The app already handles both forms.
+                "direction": "IN" if t.type == "topup" else "OUT",
                 "amount": t.amount,
                 "status": t.status,
                 "reference": t.reference,
