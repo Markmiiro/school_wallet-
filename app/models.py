@@ -23,6 +23,13 @@ class User(Base):
     pin_hash  = Column(String, nullable=True)    # hashed PIN for login
     school_id = Column(Integer, ForeignKey("schools.id"), nullable=True)
 
+    # Login rate-limiting (brute-force protection).
+    # failed_login_attempts resets to 0 on any successful login.
+    # locked_until is set once attempts hit the threshold in auth.py;
+    # NULL means "not currently locked".
+    failed_login_attempts = Column(Integer, default=0, nullable=False)
+    locked_until           = Column(DateTime, nullable=True)
+
     # Relationships
     students = relationship("Student", back_populates="parent")
 
