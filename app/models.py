@@ -40,9 +40,12 @@ class User(Base):
 class School(Base):
     __tablename__ = "schools"
 
-    id       = Column(Integer, primary_key=True, index=True)
-    name     = Column(String, nullable=False)
-    location = Column(String, nullable=True)
+    id        = Column(Integer, primary_key=True, index=True)
+    name      = Column(String, nullable=False)
+    location  = Column(String, nullable=True)
+    badge_url = Column(String, nullable=True)   # school crest/logo, set via
+                                                 # PUT /schools/{id}/badge or
+                                                 # PUT /schools/{id}/badge-url
 
     # Relationships
     students  = relationship("Student", back_populates="school")
