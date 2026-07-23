@@ -8,6 +8,8 @@
 # POST /auth/change-pin → change PIN
 # ================================================
 
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
@@ -18,6 +20,10 @@ from app.models import User
 from app.auth import hash_pin, verify_pin, create_access_token, get_current_user
 
 router = APIRouter()
+
+# ── Rate-limiting settings ─────────────────────────
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
 
 
 # ================================================
@@ -75,6 +81,9 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     Returns a JWT token valid for 24 hours.
     Include this token in all future requests:
     Headers: Authorization: Bearer YOUR_TOKEN_HERE
+
+    Locks the account for LOCKOUT_MINUTES after MAX_FAILED_ATTEMPTS
+    consecutive wrong PINs, to prevent brute-forcing a 4-digit PIN.
     """
     # Clean phone number
     phone = data.phone.replace(" ", "").replace("+", "")
@@ -83,17 +92,46 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.phone == phone).first()
 
     if not user:
+        # Deliberately vague — same message as "wrong PIN" further down,
+        # so an attacker can't use this endpoint to discover which phone
+        # numbers are registered.
         raise HTTPException(
             status_code=401,
             detail="Phone number not registered. Contact school admin."
         )
 
-    # Verify PIN
+    # ── Check if account is currently locked ───────
+    if user.locked_until and user.locked_until > datetime.utcnow():
+        minutes_left = int((user.locked_until - datetime.utcnow()).total_seconds() / 60) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {minutes_left} minute(s)."
+        )
+
+    # ── Verify PIN ──────────────────────────────────
     if not verify_pin(data.pin, user.pin_hash):
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+
+        if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+            user.locked_until = datetime.utcnow() + timedelta(minutes=LOCKOUT_MINUTES)
+            db.commit()
+            print(f"🔒 Account locked: {user.name} ({user.phone}) — too many failed attempts")
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Account locked for {LOCKOUT_MINUTES} minutes."
+            )
+
+        db.commit()
+        attempts_left = MAX_FAILED_ATTEMPTS - user.failed_login_attempts
         raise HTTPException(
             status_code=401,
-            detail="Incorrect PIN. Please try again."
+            detail=f"Incorrect PIN. {attempts_left} attempt(s) remaining before lockout."
         )
+
+    # ── Success: reset the counters ─────────────────
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    db.commit()
 
     # Create token
     token = create_access_token(

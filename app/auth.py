@@ -1,260 +1,154 @@
 # ================================================
-# app/routes/auth.py
+# app/auth.py
 # ------------------------------------------------
-# Authentication endpoints:
-# POST /auth/login    → get a JWT token
-# POST /auth/register → create a new user
-# GET  /auth/me       → get current user info
-# POST /auth/change-pin → change PIN
+# Authentication utilities — JWT creation/verification
+# and PIN hashing (bcrypt via passlib).
+#
+# This file DEFINES the functions. It does NOT import
+# from app.routes.auth — that file imports FROM here.
+#
+# Used by:
+#   app/routes/auth.py   → login, register, /me endpoints
+#   app/routes/*.py       → Depends(get_current_user) on protected routes
 # ================================================
 
+import os
 from datetime import datetime, timedelta
-
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, field_validator
 from typing import Optional
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import User
-from app.auth import hash_pin, verify_pin, create_access_token, get_current_user
 
-router = APIRouter()
+# ── Config ────────────────────────────────────────
+SECRET_KEY              = os.getenv("SECRET_KEY", "")
+ALGORITHM                = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 24
 
-# ── Rate-limiting settings ─────────────────────────
-MAX_FAILED_ATTEMPTS = 5
-LOCKOUT_MINUTES = 15
+if not SECRET_KEY:
+    # Fail loudly rather than silently signing tokens with an empty key
+    raise RuntimeError(
+        "SECRET_KEY environment variable is not set. "
+        "Set it in Railway → Variables before starting the app."
+    )
 
+# ── PIN hashing context (bcrypt) ───────────────────
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# ================================================
-# SCHEMAS
-# ================================================
-
-class LoginRequest(BaseModel):
-    phone: str
-    pin: str
-
-class RegisterRequest(BaseModel):
-    name: str
-    phone: str
-    pin: str
-    role: str
-    school_id: Optional[int] = None
-
-    @field_validator("pin")
-    def pin_must_be_4_digits(cls, v):
-        if not v.isdigit() or len(v) != 4:
-            raise ValueError("PIN must be exactly 4 digits")
-        return v
-
-    @field_validator("phone")
-    def phone_must_be_valid(cls, v):
-        v = v.replace(" ", "").replace("+", "")
-        if not v.startswith("256") or len(v) != 12:
-            raise ValueError("Phone must be 256XXXXXXXXX format")
-        return v
-
-    @field_validator("role")
-    def role_must_be_valid(cls, v):
-        if v not in ["parent", "admin", "merchant"]:
-            raise ValueError("Role must be parent, admin, or merchant")
-        return v
-
-class ChangePinRequest(BaseModel):
-    current_pin: str
-    new_pin: str
-
-    @field_validator("new_pin")
-    def pin_must_be_4_digits(cls, v):
-        if not v.isdigit() or len(v) != 4:
-            raise ValueError("New PIN must be exactly 4 digits")
-        return v
+# ── OAuth2 scheme — tells FastAPI where to find the login endpoint ──
+# tokenUrl is just used for the Swagger UI "Authorize" button.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 
 # ================================================
-# ENDPOINT 1 — Login
+# PIN HASHING
 # ================================================
-@router.post("/login")
-def login(data: LoginRequest, db: Session = Depends(get_db)):
+def hash_pin(pin: str) -> str:
+    """Hash a plaintext PIN for storage in User.pin_hash."""
+    return pwd_context.hash(pin)
+
+
+def verify_pin(plain_pin: str, hashed_pin: str) -> bool:
+    """Check a plaintext PIN against the stored bcrypt hash."""
+    if not hashed_pin:
+        return False
+    return pwd_context.verify(plain_pin, hashed_pin)
+
+
+# ================================================
+# JWT TOKEN CREATION
+# ================================================
+def create_access_token(
+    user_id: int,
+    role: str,
+    phone: str,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
     """
-    Login with phone number and PIN.
-    Returns a JWT token valid for 24 hours.
-    Include this token in all future requests:
-    Headers: Authorization: Bearer YOUR_TOKEN_HERE
+    Create a signed JWT.
 
-    Locks the account for LOCKOUT_MINUTES after MAX_FAILED_ATTEMPTS
-    consecutive wrong PINs, to prevent brute-forcing a 4-digit PIN.
+    Called from app/routes/auth.py as:
+        create_access_token(user_id=user.id, role=user.role, phone=user.phone)
+
+    "sub" is set to phone so get_current_user() can look the user
+    back up on every protected request via User.phone.
     """
-    # Clean phone number
-    phone = data.phone.replace(" ", "").replace("+", "")
+    to_encode = {
+        "sub": phone,
+        "user_id": user_id,
+        "role": role,
+    }
+    expire = datetime.utcnow() + (
+        expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    )
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-    # Find user by phone
+
+# ================================================
+# GET CURRENT USER (dependency for protected routes)
+# ================================================
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Decode the JWT from the Authorization header, look up the user,
+    and return it. Raises 401 if the token is invalid/expired or the
+    user no longer exists.
+
+    Usage in any route:
+        from app.auth import get_current_user
+        @router.get("/protected")
+        def protected_route(current_user: User = Depends(get_current_user)):
+            ...
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        phone: str = payload.get("sub")
+        if phone is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
     user = db.query(User).filter(User.phone == phone).first()
+    if user is None:
+        raise credentials_exception
 
-    if not user:
-        # Deliberately vague — same message as "wrong PIN" further down,
-        # so an attacker can't use this endpoint to discover which phone
-        # numbers are registered.
-        raise HTTPException(
-            status_code=401,
-            detail="Phone number not registered. Contact school admin."
-        )
-
-    # ── Check if account is currently locked ───────
-    if user.locked_until and user.locked_until > datetime.utcnow():
-        minutes_left = int((user.locked_until - datetime.utcnow()).total_seconds() / 60) + 1
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many failed attempts. Try again in {minutes_left} minute(s)."
-        )
-
-    # ── Verify PIN ──────────────────────────────────
-    if not verify_pin(data.pin, user.pin_hash):
-        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
-
-        if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
-            user.locked_until = datetime.utcnow() + timedelta(minutes=LOCKOUT_MINUTES)
-            db.commit()
-            print(f"🔒 Account locked: {user.name} ({user.phone}) — too many failed attempts")
-            raise HTTPException(
-                status_code=429,
-                detail=f"Too many failed attempts. Account locked for {LOCKOUT_MINUTES} minutes."
-            )
-
-        db.commit()
-        attempts_left = MAX_FAILED_ATTEMPTS - user.failed_login_attempts
-        raise HTTPException(
-            status_code=401,
-            detail=f"Incorrect PIN. {attempts_left} attempt(s) remaining before lockout."
-        )
-
-    # ── Success: reset the counters ─────────────────
-    user.failed_login_attempts = 0
-    user.locked_until = None
-    db.commit()
-
-    # Create token
-    token = create_access_token(
-        user_id=user.id,
-        role=user.role,
-        phone=user.phone,
-    )
-
-    print(f"✅ Login: {user.name} ({user.role})")
-
-    return {
-        "message":    f"Welcome back {user.name}! 👋",
-        "token":      token,
-        "token_type": "bearer",
-        "user": {
-            "id":        user.id,
-            "name":      user.name,
-            "phone":     user.phone,
-            "role":      user.role,
-            "school_id": user.school_id,
-        },
-        "expires_in": "24 hours",
-        "note": "Include token in all requests: Authorization: Bearer YOUR_TOKEN"
-    }
+    return user
 
 
 # ================================================
-# ENDPOINT 2 — Register
+# GET CURRENT ADMIN (dependency for admin-only routes)
 # ================================================
-@router.post("/register")
-def register(data: RegisterRequest, db: Session = Depends(get_db)):
-    """
-    Register a new user with a hashed PIN.
-    Role must be: parent, admin, or merchant
-    """
-    # Check phone not already registered
-    existing = db.query(User).filter(
-        User.phone == data.phone
-    ).first()
-
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="This phone number is already registered."
-        )
-
-    # Create user with hashed PIN
-    user = User(
-        name=data.name,
-        phone=data.phone,
-        pin_hash=hash_pin(data.pin),
-        role=data.role,
-        school_id=data.school_id,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    # Create token immediately so they are logged in
-    token = create_access_token(
-        user_id=user.id,
-        role=user.role,
-        phone=user.phone,
-    )
-
-    print(f"✅ New user registered: {user.name} ({user.role})")
-
-    return {
-        "message":  f"Account created successfully! Welcome {user.name} 🎉",
-        "token":    token,
-        "token_type": "bearer",
-        "user": {
-            "id":    user.id,
-            "name":  user.name,
-            "phone": user.phone,
-            "role":  user.role,
-        }
-    }
-
-
-# ================================================
-# ENDPOINT 3 — Get current user info
-# ================================================
-@router.get("/me")
-def get_me(current_user: User = Depends(get_current_user)):
-    """
-    Returns the currently logged-in user's details.
-    Use this to verify your token is working.
-    """
-    return {
-        "id":        current_user.id,
-        "name":      current_user.name,
-        "phone":     current_user.phone,
-        "role":      current_user.role,
-        "school_id": current_user.school_id,
-    }
-
-
-# ================================================
-# ENDPOINT 4 — Change PIN
-# ================================================
-@router.post("/change-pin")
-def change_pin(
-    data: ChangePinRequest,
+def get_current_admin(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
+) -> User:
     """
-    Change the logged-in user's PIN.
-    Requires current PIN for verification.
+    Builds on get_current_user — requires a valid token AND that the
+    user's role is "admin". Raises 403 if the user is logged in but
+    not an admin (e.g. parent or merchant).
+
+    Usage in any route:
+        from app.auth import get_current_admin
+        @router.get("/admin-only")
+        def admin_route(current_admin: User = Depends(get_current_admin)):
+            ...
     """
-    # Verify current PIN
-    if not verify_pin(data.current_pin, current_user.pin_hash):
+    if current_user.role != "admin":
         raise HTTPException(
-            status_code=401,
-            detail="Current PIN is incorrect."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action requires admin privileges.",
         )
-
-    # Update to new hashed PIN
-    current_user.pin_hash = hash_pin(data.new_pin)
-    db.commit()
-
-    return {
-        "message": "PIN changed successfully ✅",
-        "note":    "Please login again with your new PIN"
-    }
+    return current_user
