@@ -53,11 +53,21 @@ class Student(Base):
     # Generated at registration — see app/account_number.py.
     # Nullable so existing students (created before this field existed)
     # don't break; backfill separately if needed.
+    #
+    # dob / class_name: collected by the USSD registration flow
+    # (see app/routes/ussd.py). Nullable because students created
+    # through the app's Add Child screen don't supply them yet.
+    #
+    # dob is stored as a String, not a Date, because USSD collects it
+    # as free text with no validation — forcing a Date type would break
+    # on inputs like "12 Jan 2015". Normalise later if needed.
     id             = Column(Integer, primary_key=True, index=True)
     name           = Column(String, nullable=False)
     school_id      = Column(Integer, ForeignKey("schools.id"), nullable=False)
     parent_id      = Column(Integer, ForeignKey("users.id"), nullable=True)
     account_number = Column(String, unique=True, nullable=True, index=True)
+    dob            = Column(String, nullable=True)   # free text, e.g. "2015-01-12"
+    class_name     = Column(String, nullable=True)   # e.g. "P4", "S2"
 
     # Relationships
     school  = relationship("School", back_populates="students")
@@ -113,8 +123,19 @@ class Transaction(Base):
 
 # ════════════════════════════════════════════════
 # NFC TAGS
-# One NFC card per student.
+# One NFC card per student — this row IS the physical card.
 # tag_uid is the physical card's unique ID.
+#
+# card_color: the colour the parent chose when buying the card
+# (Blue | Green | Yellow | Red — the four approved by Yo Uganda
+# in the USSD registration flow). Lives here rather than on
+# Student because it is a property of the card, not the child.
+#
+# NOTE: this is currently a strict one-to-one with Student
+# (uselist=False). If card replacement history is needed later
+# (lost card -> new card, keeping the old record), this would
+# need to become one-to-many — which touches every caller that
+# does student.nfc_tag.
 # ════════════════════════════════════════════════
 class NFCTag(Base):
     __tablename__ = "nfc_tags"
@@ -122,6 +143,7 @@ class NFCTag(Base):
     id         = Column(Integer, primary_key=True, index=True)
     tag_uid    = Column(String, unique=True, nullable=True)
     is_active  = Column(Boolean, default=True)
+    card_color = Column(String, nullable=True)   # Blue | Green | Yellow | Red
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
 
     # Relationships

@@ -86,6 +86,15 @@ def create_tables():
     add_column_if_missing("users",        "pin_hash",    "VARCHAR")
     add_column_if_missing("users",        "school_id",   "INTEGER")
 
+    # Student registration fields collected by the USSD flow.
+    # Nullable — students added via the app don't supply them yet.
+    add_column_if_missing("students",     "dob",         "VARCHAR")
+    add_column_if_missing("students",     "class_name",  "VARCHAR")
+
+    # Card colour chosen at purchase (Blue | Green | Yellow | Red).
+    # Lives on the card record, not the student.
+    add_column_if_missing("nfc_tags",     "card_color",  "VARCHAR")
+
     print("All columns verified")
 
 
@@ -96,7 +105,7 @@ def add_column_if_missing(table: str, column: str, col_type: str):
     IMPORTANT — why this checks first instead of try/except:
 
     On PostgreSQL, a failed statement ABORTS the whole transaction.
-    The old version ran every ALTER inside one shared transaction and
+    An earlier version ran every ALTER inside one shared transaction and
     swallowed failures with a bare `except: pass`. That meant the first
     already-existing column aborted the transaction, and every column
     after it silently failed too — so new columns often never got added
