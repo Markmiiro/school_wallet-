@@ -4,14 +4,14 @@
 # Now using PostgreSQL instead of SQLite.
 #
 # WHY PostgreSQL?
-# ✅ Handles many users at once
-# ✅ Production ready
-# ✅ Required for deployment
-# ✅ Better performance
-# ✅ More reliable for financial data
+# - Handles many users at once
+# - Production ready
+# - Required for deployment
+# - Better performance
+# - More reliable for financial data
 # ================================================
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 import os
@@ -63,38 +63,71 @@ def test_connection():
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        print("✅ PostgreSQL connected successfully")
+        print("PostgreSQL connected successfully")
     except Exception as e:
-        print(f"❌ Database connection failed: {e}")
+        print(f"Database connection failed: {e}")
         raise
 
 
 def create_tables():
     from app import models  # noqa
     Base.metadata.create_all(bind=engine)
-    print("✅ All tables created in PostgreSQL")
+    print("All tables created in PostgreSQL")
 
-    # Auto-add missing columns (works for both SQLite and PostgreSQL)
-    with engine.connect() as conn:
-        add_column_if_missing(conn, "merchants",    "is_active",   "BOOLEAN DEFAULT TRUE")
-        add_column_if_missing(conn, "wallets",      "daily_limit", "INTEGER DEFAULT 20000")
-        add_column_if_missing(conn, "transactions", "status",      "VARCHAR DEFAULT 'pending'")
-        add_column_if_missing(conn, "transactions", "reference",   "VARCHAR")
-        add_column_if_missing(conn, "transactions", "momo_phone",  "VARCHAR")
-        add_column_if_missing(conn, "transactions", "description", "VARCHAR")
-        add_column_if_missing(conn, "users", "pin_hash",  "VARCHAR")
-        add_column_if_missing(conn, "users", "school_id", "INTEGER")
-        conn.commit()
-    print("✅ All columns verified")
+    # Auto-add missing columns for tables that already existed before
+    # the model gained a new field. Each column is handled in its own
+    # transaction — see add_column_if_missing() for why that matters.
+    add_column_if_missing("merchants",    "is_active",   "BOOLEAN DEFAULT TRUE")
+    add_column_if_missing("wallets",      "daily_limit", "INTEGER DEFAULT 20000")
+    add_column_if_missing("transactions", "status",      "VARCHAR DEFAULT 'pending'")
+    add_column_if_missing("transactions", "reference",   "VARCHAR")
+    add_column_if_missing("transactions", "momo_phone",  "VARCHAR")
+    add_column_if_missing("transactions", "description", "VARCHAR")
+    add_column_if_missing("users",        "pin_hash",    "VARCHAR")
+    add_column_if_missing("users",        "school_id",   "INTEGER")
+
+    print("All columns verified")
 
 
-def add_column_if_missing(conn, table: str, column: str, col_type: str):
+def add_column_if_missing(table: str, column: str, col_type: str):
     """
     Adds a column only if it does not already exist.
-    Works for both SQLite and PostgreSQL.
+
+    IMPORTANT — why this checks first instead of try/except:
+
+    On PostgreSQL, a failed statement ABORTS the whole transaction.
+    The old version ran every ALTER inside one shared transaction and
+    swallowed failures with a bare `except: pass`. That meant the first
+    already-existing column aborted the transaction, and every column
+    after it silently failed too — so new columns often never got added
+    and no error was ever printed.
+
+    This version:
+      1. Inspects the schema to see if the column is really missing.
+      2. Runs each ALTER in its own short transaction, so one failure
+         can't poison the others.
+      3. Prints real errors instead of hiding them.
     """
     try:
-        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
-        print(f"   ➕ Added column: {table}.{column}")
-    except Exception:
-        pass  # Column already exists — skip silently
+        inspector = inspect(engine)
+
+        # If the table doesn't exist yet, create_all() will have made it
+        # with all current model columns — nothing to patch.
+        if table not in inspector.get_table_names():
+            return
+
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        if column in existing:
+            return  # Already there — nothing to do.
+
+        # Own transaction per column so a failure can't cascade.
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            )
+        print(f"   Added column: {table}.{column}")
+
+    except Exception as e:
+        # Log loudly rather than silently swallowing — a genuinely
+        # failed migration should be visible in the deploy logs.
+        print(f"   WARNING: could not add {table}.{column}: {e}")
