@@ -1,36 +1,28 @@
 # ================================================
 # app/routes/webhook.py
 # ------------------------------------------------
-# Webhook callbacks from Yo Uganda (IPN).
+# Webhook callbacks from Yo Uganda.
 #
-# POST /webhook/yo
-#   Yo Uganda calls this after a parent approves
-#   a top-up payment on their phone — whether
-#   initiated via /topup (API) or via USSD.
+# Per Yo! Payments API Specification v3.48:
+#   - Successful deposits  -> POST /webhook/yo          (§6.3, "IPN")
+#   - Failed deposits      -> POST /webhook/yo/failure   (§6.4)
 #
-#   Yo Uganda sends XML or form data with:
-#     ExternalReference  -> our tx_ref (UUID or USSD ref)
-#     TransactionStatus  -> SUCCEEDED or FAILED  (uppercase)
-#     Amount             -> amount paid in UGX
-#
-#   TWO reference formats handled here:
-#   1. UUID (e.g. "a3f9c1d8-...")
-#      -> Regular top-up from /topup endpoint
-#      -> Pre-created Transaction row exists in DB
-#
-#   2. USSD-{student_id}-{amount}-{uuid8} (e.g. "USSD-42-20000-a3f9c1d8")
-#      -> USSD-initiated top-up from routes/ussd.py
-#      -> No pre-created Transaction row — we create it here
-#
-#   This endpoint must return 200 quickly.
-#   Yo Uganda retries if it does not get 200.
+# Both are FORM-ENCODED POSTs (not JSON, not XML), and both include a
+# signed field that MUST be verified using Yo Uganda's public certificate
+# before any database write happens. Signature scheme: RSA + SHA1,
+# base64-encoded. Never trust an unverified request.
 # ================================================
+
+import base64
+import os
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import Any, Dict
-import xml.etree.ElementTree as ET
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from app.database import get_db
 from app.models import Transaction, Wallet, Student, User
@@ -38,144 +30,145 @@ from app.sms import sms_topup_confirmation
 
 router = APIRouter()
 
+APP_ENV = os.getenv("APP_ENV", "development")
+CERT_DIR = Path(__file__).resolve().parent.parent / "certs"
 
-class WebhookPayload(BaseModel):
-    event: str
-    data: Dict[str, Any]
+_public_key_cache = None
 
 
+def _load_yo_public_key():
+    """
+    Loads Yo Uganda's public certificate for signature verification.
+    Uses the SANDBOX cert unless APP_ENV=production.
+    """
+    cert_file = (
+        "Yo_Uganda_Public_Certificate.crt"
+        if APP_ENV == "production"
+        else "Yo_Uganda_Public_Sandbox_Certificate.crt"
+    )
+    cert_path = CERT_DIR / cert_file
+    with open(cert_path, "rb") as f:
+        cert = x509.load_pem_x509_certificate(f.read())
+    return cert.public_key()
+
+
+def get_yo_public_key():
+    global _public_key_cache
+    if _public_key_cache is None:
+        _public_key_cache = _load_yo_public_key()
+    return _public_key_cache
+
+
+def verify_yo_signature(concatenated: str, signature_b64: str) -> bool:
+    """
+    Verifies an RSA-SHA1 signature from Yo Uganda.
+    `concatenated` must be built in the exact field order Yo Uganda specifies
+    (see API Spec §6.3.4 for IPN, §6.4.3 for failure notifications).
+    """
+    try:
+        signature = base64.b64decode(signature_b64)
+        public_key = get_yo_public_key()
+        public_key.verify(
+            signature,
+            concatenated.encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA1(),
+        )
+        return True
+    except (InvalidSignature, ValueError, Exception) as e:
+        print(f"[Yo Webhook] Signature verification FAILED: {e}")
+        return False
+
+
+# ================================================
+# SUCCESSFUL PAYMENT — Instant Payment Notification (§6.3)
+# ================================================
 @router.post("/yo")
-async def yo_uganda_webhook(
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    # ── Read raw body ─────────────────────────────
-    body      = await request.body()
-    body_text = body.decode("utf-8")
+async def yo_uganda_ipn(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
 
-    print(f"\n[Yo Webhook] Received: {body_text[:200]}")
+    date_time    = form.get("date_time", "")
+    amount_str   = form.get("amount", "")
+    narrative    = form.get("narrative", "")
+    network_ref  = form.get("network_ref", "")
+    external_ref = form.get("external_ref", "")
+    msisdn       = form.get("msisdn", "")
+    signature    = form.get("signature", "")
 
-    tx_ref = None
-    status = None
-    amount = None
+    print(f"[Yo IPN] external_ref={external_ref} amount={amount_str} msisdn={msisdn}")
 
-    # ── Try JSON first (easiest to test with curl, and some IPN
-    #    configurations may send JSON depending on setup) ──────
-    content_type = request.headers.get("content-type", "")
-    parsed = False
+    if not external_ref or not signature:
+        return {"message": "Missing required fields"}
 
-    if "application/json" in content_type:
-        try:
-            import json
-            data = json.loads(body_text)
-            tx_ref = data.get("ExternalReference") or data.get("tx_ref")
-            status = data.get("TransactionStatus") or data.get("status")
-            amount = data.get("Amount") or data.get("amount")
-            parsed = True
-        except Exception as e:
-            print(f"[Yo Webhook] JSON parse attempt failed: {e}")
+    # Signature covers, in order: date_time, amount, narrative, network_ref,
+    # external_ref, msisdn (concatenated with no separators — per §6.3.3)
+    concatenated = f"{date_time}{amount_str}{narrative}{network_ref}{external_ref}{msisdn}"
 
-    # ── Try XML (Yo Uganda's real IPN format) ─────
-    if not parsed:
-        try:
-            root = ET.fromstring(body_text)
-            for child in root.iter():
-                if child.tag == "ExternalReference":
-                    tx_ref = child.text
-                if child.tag == "TransactionStatus":
-                    status = child.text
-                if child.tag == "Amount":
-                    amount = child.text
-            parsed = True
-        except Exception:
-            pass
+    if not verify_yo_signature(concatenated, signature):
+        print(f"[Yo IPN] REJECTED — could not verify signature for external_ref={external_ref}")
+        # Return 200 so Yo doesn't retry a request we've already rejected,
+        # but credit NOTHING.
+        return {"message": "Signature verification failed"}
 
-    # ── Fall back to form data ────────────────────
-    if not parsed:
-        try:
-            form   = await request.form()
-            tx_ref = form.get("ExternalReference") or form.get("tx_ref")
-            status = form.get("TransactionStatus") or form.get("status")
-            amount = form.get("Amount") or form.get("amount")
-        except Exception as e:
-            print(f"[Yo Webhook] Could not parse body: {e}")
-            return {"message": "Could not parse request body"}
+    try:
+        amount = int(float(amount_str))
+    except ValueError:
+        return {"message": "Invalid amount"}
 
-    print(f"[Yo Webhook] Ref={tx_ref} Status={status} Amount={amount}")
+    tx_ref = external_ref
 
-    # ── Validate reference ────────────────────────
-    if not tx_ref:
-        return {"message": "No transaction reference found"}
-
-    # ──────────────────────────────────────────────
-    # USSD-INITIATED TOP-UP BRANCH
-    # Reference format: USSD-{student_id}-{amount}-{uuid8}
-    # No pre-created Transaction exists — we create it here on success.
-    # ──────────────────────────────────────────────
+    # ---------------- USSD-initiated top-up ----------------
     if tx_ref.startswith("USSD-"):
         parts = tx_ref.split("-")
-        # Expected: ["USSD", student_id, amount, uuid8]
         if len(parts) < 4:
-            print(f"[Yo Webhook] Malformed USSD ref: {tx_ref}")
+            print(f"[Yo IPN] Malformed USSD ref: {tx_ref}")
             return {"message": "Malformed USSD reference"}
 
         try:
             ussd_student_id = int(parts[1])
-            ussd_amount     = int(parts[2])
+            ussd_amount = int(parts[2])
         except ValueError:
-            print(f"[Yo Webhook] Could not parse USSD ref parts: {tx_ref}")
+            print(f"[Yo IPN] Could not parse USSD ref parts: {tx_ref}")
             return {"message": "Could not parse USSD reference"}
 
-        # Idempotency: check if this USSD ref was already processed
-        existing = db.query(Transaction).filter(
-            Transaction.reference == tx_ref
-        ).first()
+        existing = db.query(Transaction).filter(Transaction.reference == tx_ref).first()
         if existing:
             return {"message": f"USSD payment already processed: {existing.status}"}
 
-        if status != "SUCCEEDED":
-            print(f"[Yo Webhook] USSD payment failed: {status} — Ref: {tx_ref}")
-            return {"message": f"USSD payment not completed: {status}"}
+        # Cross-check the VERIFIED amount from Yo against what the reference
+        # string claims. A verified signature proves Yo really sent this
+        # notification, but this guards against the amount portion of the
+        # reference being tampered with before it ever reached Yo.
+        if amount != ussd_amount:
+            print(
+                f"[Yo IPN] Amount mismatch for {tx_ref}: "
+                f"IPN says {amount}, reference says {ussd_amount}"
+            )
+            return {"message": "Amount mismatch — not credited"}
 
-        # Credit the wallet
-        wallet = (
-            db.query(Wallet)
-            .filter(Wallet.student_id == ussd_student_id)
-            .first()
-        )
+        wallet = db.query(Wallet).filter(Wallet.student_id == ussd_student_id).first()
         if not wallet:
-            print(f"[Yo Webhook] USSD: wallet not found for student {ussd_student_id}")
+            print(f"[Yo IPN] USSD: wallet not found for student {ussd_student_id}")
             return {"message": "Wallet not found"}
 
         wallet.balance += ussd_amount
-
-        # Create the transaction record (didn't exist before payment confirmed)
-        ussd_txn = Transaction(
+        db.add(Transaction(
             wallet_id=wallet.id,
             amount=ussd_amount,
             type="topup",
             status="completed",
             reference=tx_ref,
-            momo_phone="",
+            momo_phone=msisdn,
             description="USSD top-up via School Wallet",
-        )
-        db.add(ussd_txn)
+        ))
         db.commit()
 
-        print(
-            f"[Yo Webhook] USSD top-up: "
-            f"student {ussd_student_id} credited UGX {ussd_amount:,}"
-        )
+        print(f"[Yo IPN] USSD top-up: student {ussd_student_id} credited UGX {ussd_amount:,}")
 
-        # Send SMS to parent
         try:
-            student = db.query(Student).filter(
-                Student.id == ussd_student_id
-            ).first()
+            student = db.query(Student).filter(Student.id == ussd_student_id).first()
             if student:
-                parent = db.query(User).filter(
-                    User.id == student.parent_id
-                ).first()
+                parent = db.query(User).filter(User.id == student.parent_id).first()
                 if parent and parent.phone:
                     await sms_topup_confirmation(
                         parent_phone=parent.phone,
@@ -184,67 +177,74 @@ async def yo_uganda_webhook(
                         new_balance=wallet.balance,
                     )
         except Exception as e:
-            print(f"[Yo Webhook] USSD SMS error (non-fatal): {e}")
+            print(f"[Yo IPN] USSD SMS error (non-fatal): {e}")
 
         return {"message": "USSD top-up credited successfully"}
 
-    # ──────────────────────────────────────────────
-    # REGULAR TOP-UP BRANCH (UUID reference from /topup endpoint)
-    # ──────────────────────────────────────────────
-
-    # ── Find pre-created transaction ──────────────
-    txn = db.query(Transaction).filter(
-        Transaction.reference == tx_ref
-    ).first()
-
+    # ---------------- Regular top-up (pre-created Transaction) ----------------
+    txn = db.query(Transaction).filter(Transaction.reference == tx_ref).first()
     if not txn:
-        # Return 200 so Yo Uganda stops retrying
         return {"message": f"Transaction not found: {tx_ref}"}
 
-    # ── Idempotency — never process twice ─────────
     if txn.status != "pending":
         return {"message": f"Already processed: {txn.status}"}
 
-    # ── SUCCEEDED -> credit wallet ─────────────────
-    if status == "SUCCEEDED":
-        wallet = db.query(Wallet).filter(
-            Wallet.id == txn.wallet_id
-        ).first()
+    wallet = db.query(Wallet).filter(Wallet.id == txn.wallet_id).first()
+    if not wallet:
+        return {"message": "Wallet not found"}
 
-        if not wallet:
-            return {"message": "Wallet not found"}
+    wallet.balance += txn.amount
+    txn.status = "completed"
+    db.commit()
 
-        wallet.balance += txn.amount
-        txn.status      = "completed"
-        db.commit()
+    print(f"[Yo IPN] Wallet {wallet.id} credited UGX {txn.amount:,}")
 
-        print(f"[Yo Webhook] Wallet {wallet.id} credited UGX {txn.amount:,}")
+    try:
+        student = db.query(Student).filter(Student.id == wallet.student_id).first()
+        if student:
+            parent = db.query(User).filter(User.id == student.parent_id).first()
+            if parent and parent.phone:
+                await sms_topup_confirmation(
+                    parent_phone=parent.phone,
+                    student_name=student.name,
+                    amount=txn.amount,
+                    new_balance=wallet.balance,
+                )
+    except Exception as e:
+        print(f"[Yo IPN] SMS error (non-fatal): {e}")
 
-        # ── Send SMS to parent ─────────────────────
-        try:
-            student = db.query(Student).filter(
-                Student.id == wallet.student_id
-            ).first()
-            if student:
-                parent = db.query(User).filter(
-                    User.id == student.parent_id
-                ).first()
-                if parent and parent.phone:
-                    await sms_topup_confirmation(
-                        parent_phone=parent.phone,
-                        student_name=student.name,
-                        amount=txn.amount,
-                        new_balance=wallet.balance,
-                    )
-        except Exception as e:
-            # SMS failure must never block wallet credit
-            print(f"[Yo Webhook] SMS error (non-fatal): {e}")
+    return {"message": "Wallet credited successfully"}
 
-        return {"message": "Wallet credited successfully"}
 
-    # ── FAILED -> mark failed ──────────────────────
-    else:
+# ================================================
+# FAILED PAYMENT — Transaction Failure Notification (§6.4)
+# ================================================
+# NOTE: this requires momo.py to also send a <FailureNotificationUrl>
+# pointing here when initiating deposits — currently it doesn't (see below).
+@router.post("/yo/failure")
+async def yo_uganda_failure_notification(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+
+    failed_ref    = form.get("failed_transaction_reference", "")
+    init_date     = form.get("transaction_init_date", "")
+    verification  = form.get("verification", "")
+
+    print(f"[Yo Failure] ref={failed_ref}")
+
+    if not failed_ref or not verification:
+        return {"message": "Missing required fields"}
+
+    # Signature covers, in order: failed_transaction_reference, transaction_init_date
+    concatenated = f"{failed_ref}{init_date}"
+
+    if not verify_yo_signature(concatenated, verification):
+        print(f"[Yo Failure] REJECTED — could not verify signature for ref={failed_ref}")
+        return {"message": "Signature verification failed"}
+
+    txn = db.query(Transaction).filter(Transaction.reference == failed_ref).first()
+    if txn and txn.status == "pending":
         txn.status = "failed"
         db.commit()
-        print(f"[Yo Webhook] Payment failed: {status} — Ref: {tx_ref}")
-        return {"message": f"Payment failed: {status}"}
+        print(f"[Yo Failure] Marked {failed_ref} as failed")
+
+    return {"message": "Failure notification processed"}
