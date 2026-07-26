@@ -36,4 +36,7 @@ __pycache__/
 
 # ── OS FILES ─────────────────────────────────────
 .DS_Store
-Thumbs.db
+Thumbs.dbprivate_key.pem
+
+private_key.pem
+*.pem
