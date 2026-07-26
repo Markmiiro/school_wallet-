@@ -152,3 +152,69 @@ def get_current_admin(
             detail="This action requires admin privileges.",
         )
     return current_user
+
+
+# ================================================
+# SCHOOL SCOPING
+# ------------------------------------------------
+# get_current_admin answers "is this an admin?".
+# These answer "is this admin allowed to touch THIS school?".
+#
+# The rule:
+#   role="admin", school_id=3     → manages school 3 only
+#   role="admin", school_id=NULL  → super admin, manages everything
+#
+# No new role value, so nothing that already checks
+# role == "admin" needs changing.
+#
+# ⚠️ Because NULL means "unlimited", every admin who should be
+# scoped MUST have school_id set explicitly. Check with:
+#   SELECT id, name, phone, school_id FROM users WHERE role='admin';
+# Only your own account should have school_id NULL.
+# ================================================
+def is_super_admin(user: User) -> bool:
+    """True for an admin with no school attached — full cross-school access."""
+    return user.role == "admin" and user.school_id is None
+
+
+def assert_school_access(user: User, school_id: Optional[int]) -> None:
+    """
+    Raise 403 unless `user` may act on a resource belonging to `school_id`.
+
+    Call it AFTER loading the resource, using that resource's school:
+
+        student = db.query(Student).filter(Student.id == student_id).first()
+        if not student:
+            raise HTTPException(404, "Student not found")
+        assert_school_access(current_admin, student.school_id)
+
+    Note the school comes from the resource, never from the request — a
+    caller-supplied school_id would defeat the whole check.
+    """
+    if is_super_admin(user):
+        return
+
+    # A scoped admin with no school of their own can act on nothing.
+    if user.school_id is None or school_id is None or user.school_id != school_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only manage students and cards in your own school.",
+        )
+
+
+def visible_school_id(user: User) -> Optional[int]:
+    """
+    The school a list query should be filtered to, or None for "no filter".
+
+        q = db.query(Student)
+        school = visible_school_id(current_user)
+        if school is not None:
+            q = q.filter(Student.school_id == school)
+
+    Returns None only for super admins. Everyone else is pinned to their
+    own school, so a merchant or scoped admin cannot enumerate other
+    schools by leaving a filter off.
+    """
+    if is_super_admin(user):
+        return None
+    return user.school_id
