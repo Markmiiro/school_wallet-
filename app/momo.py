@@ -11,18 +11,18 @@
 #    (acdepositfunds — asynchronous, NonBlocking=TRUE)
 #
 # 2. disburse_to_merchant → pay vendor at end of day
-#    (acwithdrawfunds)
+#    (acwithdrawfunds — RSA-signed, see below)
 #
 # DOCS: https://payments.yo.co.ug
 # SANDBOX: https://sandbox.yo.co.ug
 # SUPPORT: support@yo.co.ug | +256 788 238665
 #
 # ------------------------------------------------
-# FIELD NAMES — these come from Yo! Payments API
-# Specification v3.48 §6.1.1 and must match EXACTLY.
+# FIELD NAMES — from Yo! Payments API Specification
+# v3.48 §4.1 and §6.1.1. These must match EXACTLY.
 # Yo silently ignores unrecognised fields, so a typo
-# here means callbacks never fire and transactions
-# sit PENDING forever with no error anywhere.
+# means callbacks never fire and transactions sit
+# PENDING forever with no error anywhere.
 #
 #   <InstantNotificationUrl>  → success callbacks (§6.3)
 #   <FailureNotificationUrl>  → failure callbacks (§6.4)
@@ -37,21 +37,43 @@
 #   - top-ups appear to succeed with no real money moving
 #   - merchant payouts report success with nothing sent
 # Before going live, confirm BOTH are set correctly in
-# Railway → Variables, or the app will silently fake
-# every transaction.
+# Railway → Variables.
 #
-# ⚠️ OUTSTANDING: disburse_to_merchant does NOT sign its
-# requests. Per API spec §4, withdraw requests require an
-# RSA signature generated with YOUR private key (public
-# half shared with Yo support). Yo will only process signed
-# withdraw requests, so real payouts will fail until this
-# is implemented.
+# ------------------------------------------------
+# WITHDRAW SIGNING (§4.1)
+#
+# Yo only processes acwithdrawfunds requests signed with
+# YOUR private key, once your public key is registered on
+# your Yo account profile.
+#
+# Setup (one time):
+#   openssl genpkey -algorithm RSA -out private_key.pem \
+#       -pkeyopt rsa_keygen_bits:2048
+#   openssl rsa -pubout -in private_key.pem -out public_key.pem
+#
+#   1. Send ONLY public_key.pem to your Yo account rep.
+#   2. Put the contents of private_key.pem in the
+#      YO_PRIVATE_KEY environment variable (Railway).
+#   3. NEVER commit private_key.pem — keep it in .gitignore.
+#      Do not share it with anyone, including Yo support.
+#
+# Signature construction, in this exact order:
+#   concat = APIUsername + Amount + Account + Narrative
+#            + ExternalReference + PublicKeyAuthenticationNonce
+#   sig    = base64( RSA_sign_SHA1( SHA1_hex(concat) ) )
+#
+# Narrative / ExternalReference / Nonce are each truncated
+# to their first 255 chars before concatenation.
 # ================================================
 
+import base64
+import hashlib
 import httpx
 import os
 import uuid
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -75,7 +97,14 @@ YO_FAILURE_URL = os.getenv(
     "https://web-production-454a5.up.railway.app/webhook/yo/failure"
 )
 
+# PEM-encoded RSA private key used to sign withdraw requests.
+# Set this in Railway → Variables. Never commit the key itself.
+YO_PRIVATE_KEY = os.getenv("YO_PRIVATE_KEY", "")
+
 APP_ENV = os.getenv("APP_ENV", "development")
+
+# Per §4.1, these fields are truncated before signing.
+_SIGNATURE_FIELD_MAX = 255
 
 
 # ================================================
@@ -113,6 +142,72 @@ def _is_test_mode() -> bool:
     Kept as one function so the condition can't drift between callers.
     """
     return (not YO_USERNAME) or (APP_ENV != "production")
+
+
+def _generate_nonce() -> str:
+    """
+    PublicKeyAuthenticationNonce (§4.1).
+
+    MUST be unique for every single API call — including calls that
+    fail. Deliberately NOT derived from any transaction reference,
+    since those can be retried or reused. Alphanumeric only, well
+    under the 255-char limit.
+    """
+    return uuid.uuid4().hex
+
+
+def sign_withdraw_request(
+    amount: int,
+    account: str,
+    narrative: str,
+    external_reference: str,
+    nonce: str,
+) -> str:
+    """
+    Build PublicKeyAuthenticationSignatureBase64 for acwithdrawfunds (§4.1).
+
+    Concatenation order is fixed by the spec and must not change:
+        APIUsername, Amount, Account, Narrative,
+        ExternalReference, PublicKeyAuthenticationNonce
+
+    The signed payload is the SHA1 *hex digest* of that string, which is
+    then RSA-signed using SHA1 as the signature algorithm (§4.2.3), and
+    base64-encoded. This mirrors how app/routes/ussd.py verifies Yo's
+    own signatures, and how Yo's reference PHP library signs.
+
+    Raises RuntimeError if YO_PRIVATE_KEY is not configured.
+    """
+    if not YO_PRIVATE_KEY:
+        raise RuntimeError(
+            "YO_PRIVATE_KEY is not set. Withdraw requests cannot be signed. "
+            "Generate a keypair (see header of this file), register the "
+            "public key with Yo Uganda, and set the private key in Railway."
+        )
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    concat = (
+        f"{YO_USERNAME}"
+        f"{amount}"
+        f"{account}"
+        f"{narrative[:_SIGNATURE_FIELD_MAX]}"
+        f"{external_reference[:_SIGNATURE_FIELD_MAX]}"
+        f"{nonce[:_SIGNATURE_FIELD_MAX]}"
+    )
+
+    sha1_hex = hashlib.sha1(concat.encode("utf-8")).hexdigest()  # noqa: S324
+
+    private_key = serialization.load_pem_private_key(
+        YO_PRIVATE_KEY.encode("utf-8"),
+        password=None,
+    )
+    signature = private_key.sign(
+        sha1_hex.encode("utf-8"),
+        padding.PKCS1v15(),
+        hashes.SHA1(),  # noqa: S303 — required by Yo Uganda spec §4.2.3
+    )
+    return base64.b64encode(signature).decode("utf-8")
 
 
 # ================================================
@@ -164,21 +259,23 @@ async def charge_mobile_money(
     # ── Format phone ────────────────────────────
     phone = phone.strip().replace("+", "").replace(" ", "")
 
+    narrative = f"School Wallet top-up for {customer_name}"
+
     # ── Build XML request (§6.1.1) ───────────────
     xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
 <AutoCreate>
   <Request>
-    <APIUsername>{YO_USERNAME}</APIUsername>
-    <APIPassword>{YO_PASSWORD}</APIPassword>
+    <APIUsername>{xml_escape(YO_USERNAME)}</APIUsername>
+    <APIPassword>{xml_escape(YO_PASSWORD)}</APIPassword>
     <Method>acdepositfunds</Method>
     <NonBlocking>TRUE</NonBlocking>
     <Amount>{amount}</Amount>
     <Account>{phone}</Account>
-    <Narrative>School Wallet top-up for {customer_name}</Narrative>
-    <ExternalReference>{tx_ref}</ExternalReference>
-    <ProviderReferenceText>{tx_ref}</ProviderReferenceText>
-    <InstantNotificationUrl>{YO_IPN_URL}</InstantNotificationUrl>
-    <FailureNotificationUrl>{YO_FAILURE_URL}</FailureNotificationUrl>
+    <Narrative>{xml_escape(narrative)}</Narrative>
+    <ExternalReference>{xml_escape(tx_ref)}</ExternalReference>
+    <ProviderReferenceText>{xml_escape(tx_ref)}</ProviderReferenceText>
+    <InstantNotificationUrl>{xml_escape(YO_IPN_URL)}</InstantNotificationUrl>
+    <FailureNotificationUrl>{xml_escape(YO_FAILURE_URL)}</FailureNotificationUrl>
   </Request>
 </AutoCreate>"""
 
@@ -237,10 +334,10 @@ async def verify_transaction(tx_ref: str) -> dict:
     xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
 <AutoCreate>
   <Request>
-    <APIUsername>{YO_USERNAME}</APIUsername>
-    <APIPassword>{YO_PASSWORD}</APIPassword>
+    <APIUsername>{xml_escape(YO_USERNAME)}</APIUsername>
+    <APIPassword>{xml_escape(YO_PASSWORD)}</APIPassword>
     <Method>actransactioncheckstatus</Method>
-    <PrivateTransactionReference>{tx_ref}</PrivateTransactionReference>
+    <PrivateTransactionReference>{xml_escape(tx_ref)}</PrivateTransactionReference>
   </Request>
 </AutoCreate>"""
 
@@ -272,18 +369,23 @@ async def disburse_to_merchant(
     Uses Yo Uganda acwithdrawfunds. Money leaves your Yo Uganda float
     account and lands in the merchant's MTN/Airtel wallet.
 
-    ⚠️ NOT PRODUCTION READY: per §4, withdraw requests must carry an
-    RSA signature in <AuthenticationSignatureBase64>, generated with a
-    private key whose public half is registered with Yo support. That
-    is not implemented here, so live payouts will be rejected.
+    Signed with your private key per §4.1 — Yo will reject unsigned
+    requests once public key authentication is enabled on your account.
 
-    Recommended flow (§4.1): debit the merchant's balance on your side
-    FIRST, then call this; if Yo reports failure, reverse the debit.
+    IMPORTANT (§4.1 guidance): debit the merchant's balance on YOUR side
+    first, then call this. If Yo reports failure, reverse that debit.
+    Do not credit-on-success only, or a network error mid-call leaves
+    you unable to tell whether the money moved — use verify_transaction()
+    with the returned reference to resolve INDETERMINATE cases.
 
     Args:
         phone         → merchant's MoMo e.g. "256700000001"
         amount        → daily sales total in UGX
         merchant_name → used in the payment narrative
+
+    Returns:
+        dict with Status, TransactionStatus, and (on success) the
+        ExternalReference we generated, so the caller can reconcile.
     """
 
     # ── TEST MODE ──────────────────────────────
@@ -298,19 +400,38 @@ async def disburse_to_merchant(
             "StatusMessage":     "TEST MODE — no real payout",
         }
 
-    phone   = phone.strip().replace("+", "").replace(" ", "")
-    ext_ref = str(uuid.uuid4())
+    phone     = phone.strip().replace("+", "").replace(" ", "")
+    ext_ref   = str(uuid.uuid4())
+    nonce     = _generate_nonce()
+    narrative = f"Daily payout to {merchant_name}"
+
+    # ── Sign the request (§4.1) ──────────────────
+    try:
+        signature = sign_withdraw_request(
+            amount=amount,
+            account=phone,
+            narrative=narrative,
+            external_reference=ext_ref,
+            nonce=nonce,
+        )
+    except Exception as e:
+        # Do NOT send an unsigned request — Yo would reject it anyway,
+        # and a clear error here is easier to diagnose than a -x code.
+        print(f"Yo Uganda payout signing error: {e}")
+        return {"Status": "ERROR", "StatusMessage": f"Signing failed: {e}"}
 
     xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
 <AutoCreate>
   <Request>
-    <APIUsername>{YO_USERNAME}</APIUsername>
-    <APIPassword>{YO_PASSWORD}</APIPassword>
+    <APIUsername>{xml_escape(YO_USERNAME)}</APIUsername>
+    <APIPassword>{xml_escape(YO_PASSWORD)}</APIPassword>
     <Method>acwithdrawfunds</Method>
     <Amount>{amount}</Amount>
     <Account>{phone}</Account>
-    <Narrative>Daily payout to {merchant_name}</Narrative>
-    <ExternalReference>{ext_ref}</ExternalReference>
+    <Narrative>{xml_escape(narrative)}</Narrative>
+    <ExternalReference>{xml_escape(ext_ref)}</ExternalReference>
+    <PublicKeyAuthenticationNonce>{xml_escape(nonce)}</PublicKeyAuthenticationNonce>
+    <PublicKeyAuthenticationSignatureBase64>{signature}</PublicKeyAuthenticationSignatureBase64>
   </Request>
 </AutoCreate>"""
 
@@ -323,8 +444,18 @@ async def disburse_to_merchant(
                 timeout=30.0,
             )
         result = parse_yo_response(response.text)
-        print(f"Yo Uganda payout: {result.get('Status')} — {merchant_name} — ref {ext_ref}")
+        result.setdefault("ExternalReference", ext_ref)
+
+        print(
+            f"Yo Uganda payout: {result.get('Status')} "
+            f"({result.get('TransactionStatus', 'n/a')}) — "
+            f"{merchant_name} — ref {ext_ref}"
+        )
         return result
     except Exception as e:
         print(f"Yo Uganda payout error: {e}")
-        return {"Status": "ERROR", "StatusMessage": str(e)}
+        return {
+            "Status":            "ERROR",
+            "StatusMessage":     str(e),
+            "ExternalReference": ext_ref,
+        }

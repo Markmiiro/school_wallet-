@@ -40,3 +40,6 @@ Thumbs.dbprivate_key.pem
 
 private_key.pem
 *.pem
+
+private_key.pem
+*.pem
