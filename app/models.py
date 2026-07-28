@@ -184,6 +184,22 @@ class Merchant(Base):
 # Records of NFC payment attempts at tuck shop.
 # Separate from Transactions to track
 # payment-specific details (NFC, offline sync).
+#
+# reference = idempotency key: a client-generated UUID sent once per
+# NFC tap by the tuck-shop device (see app/routes/payments.py's
+# nfc_payment()). unique=True is defense-in-depth against a genuine
+# duplicate request racing past the wallet row lock — the row lock is
+# the primary protection.
+#
+# NOTE: unique=True only takes effect on freshly created tables
+# (create_all() does not retroactively ALTER an existing table's
+# constraints). The `payments` table has never had any rows written to
+# it, so this is safe to create fresh anywhere it doesn't already
+# exist — but on an environment where the table was already created
+# without this constraint, someone needs to run
+#   ALTER TABLE payments ADD CONSTRAINT payments_reference_key UNIQUE (reference);
+# by hand. Not run here — no DDL against any live database from this
+# session.
 # ════════════════════════════════════════════════
 class Payment(Base):
     __tablename__ = "payments"
@@ -192,7 +208,7 @@ class Payment(Base):
     wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False)
     amount    = Column(Float, nullable=False)
     status    = Column(String, nullable=False)     # completed | failed
-    reference = Column(String, nullable=True)      # idempotency key
+    reference = Column(String, nullable=True, unique=True)  # idempotency key
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     # Relationships

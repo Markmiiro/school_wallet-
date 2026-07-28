@@ -344,6 +344,8 @@ const API_BASE    = window.location.origin;
 const MERCHANT_ID = 1; // Set this per device
 
 let currentTagUid = null;
+let currentRequestId = null;   // one UUID per tap; sent with the charge so a
+                                // retry of this exact attempt doesn't double-charge
 
 // ── Load merchant name ───────────────────────────
 window.onload = async function() {
@@ -384,6 +386,7 @@ async function startNFC() {
 // ── Student taps bracelet ────────────────────────
 async function onStudentTap(uid) {
     currentTagUid = uid;
+    currentRequestId = crypto.randomUUID();
 
     // Show loading
     document.getElementById('waiting').innerHTML =
@@ -444,7 +447,7 @@ async function processPayment() {
         const res = await fetch(
             `${API_BASE}/payments/nfc?tag_uid=${currentTagUid}` +
             `&merchant_id=${MERCHANT_ID}&amount=${amount}` +
-            `&description=Tuck shop purchase`,
+            `&description=Tuck shop purchase&request_id=${currentRequestId}`,
             { method: 'POST' }
         );
         const data = await res.json();

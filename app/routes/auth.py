@@ -92,12 +92,17 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.phone == phone).first()
 
     if not user:
-        # Deliberately vague — same message as "wrong PIN" further down,
-        # so an attacker can't use this endpoint to discover which phone
-        # numbers are registered.
+        # Deliberately worded to match a fresh account's first wrong-PIN
+        # message below, so a single probe can't distinguish "this phone
+        # isn't registered" from "this phone is registered but the PIN was
+        # wrong." Not a perfect defense — if an attacker first builds up
+        # failed attempts against a real number, its count will start to
+        # diverge from this fixed one — but it closes the trivial
+        # single-request enumeration this endpoint's comment always
+        # claimed to prevent.
         raise HTTPException(
             status_code=401,
-            detail="Phone number not registered. Contact school admin."
+            detail=f"Incorrect PIN. {MAX_FAILED_ATTEMPTS - 1} attempt(s) remaining before lockout."
         )
 
     # ── Check if account is currently locked ───────

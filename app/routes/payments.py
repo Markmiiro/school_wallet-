@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from datetime import datetime, date
 
 from app.database import get_db
-from app.models import Wallet, Merchant, Transaction
+from app.models import Wallet, Merchant, Transaction, Payment
 from app.sms import sms_payment_alert, sms_low_balance_alert
 from app.models import Student, User
 from app.auth import get_current_user
@@ -34,14 +35,25 @@ def make_payment(
     Money moves inside your system immediately.
 
     SAFETY CHECKS:
+    0. Amount must be positive
     1. Wallet must exist and be active
     2. Merchant must exist
     3. Balance must cover the amount
     4. Amount must not exceed daily limit
     """
 
+    # ── CHECK 0: Amount is positive ─────────────
+    if amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Amount must be greater than zero"
+        )
+
     # ── CHECK 1: Wallet exists ──────────────────
-    wallet = db.query(Wallet).filter(Wallet.id == wallet_id).first()
+    # with_for_update() locks this row until commit/rollback, so a second
+    # concurrent payment against the same wallet blocks here instead of
+    # reading a stale balance and clobbering this one's write.
+    wallet = db.query(Wallet).filter(Wallet.id == wallet_id).with_for_update().first()
     if not wallet:
         raise HTTPException(status_code=404, detail="Wallet not found")
 
@@ -233,11 +245,34 @@ def get_merchant_payments(
 # It looks up the student by their bracelet UID
 # and deducts the payment from their wallet.
 # ================================================
+def _idempotent_replay_response(db: Session, tag_uid: str, wallet: Wallet, request_id: str):
+    """
+    Same response shape nfc_payment() returns on success, reconstructed
+    for a request_id that was already processed. Used both when we detect
+    the duplicate up front and when a concurrent duplicate wins a DB-level
+    race (see the IntegrityError handling below).
+    """
+    txn = db.query(Transaction).filter(Transaction.reference == request_id).first()
+    merchant = db.query(Merchant).filter(Merchant.id == txn.merchant_id).first() if txn else None
+    return {
+        "message": "NFC payment successful ✅",
+        "tag_uid": tag_uid,
+        "merchant": merchant.name if merchant else None,
+        "amount_paid": txn.amount if txn else None,
+        "remaining_balance": wallet.balance,
+        "currency": "UGX",
+        "transaction_id": txn.id if txn else None,
+        "timestamp": txn.timestamp if txn else None,
+        "idempotent_replay": True,
+    }
+
+
 @router.post("/nfc")
 def nfc_payment(
     tag_uid: str,       # the NFC bracelet's unique ID
     merchant_id: int,
     amount: int,
+    request_id: str,    # client-generated UUID, one per tap — idempotency key
     description: str = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)  # ← add this
@@ -246,9 +281,13 @@ def nfc_payment(
     Process a payment when a student taps their NFC bracelet.
 
     The tuck shop device sends:
-    - tag_uid    → the bracelet's unique ID e.g. "A3F2B1C4"
+    - tag_uid     → the bracelet's unique ID e.g. "A3F2B1C4"
     - merchant_id → which tuck shop
     - amount      → how much to charge
+    - request_id  → a UUID the device generates once per tap. If this
+                    exact request was already processed (e.g. the device
+                    retried after losing the response), the same result
+                    is returned instead of charging again.
 
     Your server:
     1. Looks up which student owns this bracelet
@@ -258,6 +297,13 @@ def nfc_payment(
     5. Sends SMS to parent
     """
     from app.models import NFCTag
+
+    # ── CHECK 0: Amount is positive ─────────────
+    if amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Amount must be greater than zero"
+        )
 
     # ── FIND STUDENT BY NFC TAG ─────────────────
     nfc = db.query(NFCTag).filter(
@@ -271,9 +317,12 @@ def nfc_payment(
         )
 
     # ── FIND WALLET ─────────────────────────────
+    # with_for_update() locks this row until commit/rollback, so a second
+    # concurrent tap against the same wallet blocks here instead of
+    # reading a stale balance and clobbering this one's write.
     wallet = db.query(Wallet).filter(
         Wallet.student_id == nfc.student_id
-    ).first()
+    ).with_for_update().first()
 
     if not wallet:
         raise HTTPException(status_code=404, detail="Wallet not found")
@@ -283,6 +332,14 @@ def nfc_payment(
             status_code=403,
             detail="Wallet is deactivated. Contact school admin."
         )
+
+    # ── IDEMPOTENCY CHECK ────────────────────────
+    # Runs AFTER the wallet row lock above, so a genuine concurrent retry
+    # of this exact request_id blocks on that lock, then lands here and
+    # sees the now-committed Payment row instead of racing past this check.
+    existing_payment = db.query(Payment).filter(Payment.reference == request_id).first()
+    if existing_payment:
+        return _idempotent_replay_response(db, tag_uid, wallet, request_id)
 
     # ── FIND MERCHANT ────────────────────────────
     merchant = db.query(Merchant).filter(
@@ -334,11 +391,32 @@ def nfc_payment(
         amount=amount,
         type="payment",
         status="completed",
+        reference=request_id,
         description=description or f"NFC payment at {merchant.name}",
         timestamp=datetime.utcnow(),
     )
     db.add(txn)
-    db.commit()
+
+    # ── RECORD PAYMENT (idempotency ledger) ──────
+    db.add(Payment(
+        wallet_id=wallet.id,
+        amount=amount,
+        status="completed",
+        reference=request_id,
+    ))
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent request with this exact request_id won the race and
+        # committed first — belt-and-suspenders, since the wallet row lock
+        # above should already prevent this for same-wallet duplicates.
+        # Roll back this attempt and hand back their result instead of
+        # erroring out or double-charging.
+        db.rollback()
+        db.refresh(wallet)
+        return _idempotent_replay_response(db, tag_uid, wallet, request_id)
+
     db.refresh(txn)
 
     print(f"\n📡 NFC Payment:")
@@ -434,6 +512,15 @@ def sync_offline_payments(
         offline_time = payment.get("timestamp")
 
         try:
+            # Amount must be positive
+            if not isinstance(amount, (int, float)) or amount <= 0:
+                failed.append({
+                    "tag_uid": tag_uid,
+                    "amount": amount,
+                    "reason": "Amount must be greater than zero"
+                })
+                continue
+
             # Find NFC tag
             nfc = db.query(NFCTag).filter(
                 NFCTag.tag_uid == tag_uid
@@ -448,9 +535,12 @@ def sync_offline_payments(
                 continue
 
             # Find wallet
+            # with_for_update() locks this row until commit/rollback, so a
+            # concurrent payment against the same wallet blocks here instead
+            # of reading a stale balance and clobbering this one's write.
             wallet = db.query(Wallet).filter(
                 Wallet.student_id == nfc.student_id
-            ).first()
+            ).with_for_update().first()
 
             if not wallet or not wallet.is_active:
                 failed.append({
