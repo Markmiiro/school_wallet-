@@ -65,7 +65,7 @@ def test_report_stolen_blocks_offline_sync_payment(
     r = client.post(
         "/payments/sync",
         params={"device_id": "tuckshop-1", "merchant_id": merchant.id},
-        json=[{"tag_uid": old_uid, "amount": 1000, "timestamp": "2026-07-30T10:00:00"}],
+        json=[{"tag_uid": old_uid, "amount": 1000, "request_id": str(uuid.uuid4()), "timestamp": "2026-07-30T10:00:00"}],
         headers=admin_headers,
     )
     assert r.status_code == 200

@@ -295,6 +295,14 @@ def tuckshop_interface():
             text-align: center;
             margin-top: 16px;
         }
+
+        .offline-badge {
+            color: #ffaa00;
+            font-size: 12px;
+            text-align: center;
+            margin-top: 8px;
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -414,6 +422,7 @@ def tuckshop_interface():
         </div>
 
         <div class="merchant-tag" id="merchantTag">Loading...</div>
+        <div class="offline-badge" id="offlineBadge"></div>
 
     </div>
 </div>
@@ -583,8 +592,14 @@ function enterApp() {
     document.getElementById('appBlock').style.display = 'flex';
     document.getElementById('who').textContent = ME ? `${ME.name} · ${ME.role}` : '';
     document.getElementById('merchantTag').textContent = `🏪 ${MERCHANT_NAME || 'Tuck Shop'}`;
+    updateOfflineBadge();
+    flushOfflineQueue();
     startNFC();
 }
+
+// Fires the moment the browser regains connectivity — the main trigger
+// for draining whatever piled up in the offline queue while it was down.
+window.addEventListener('online', flushOfflineQueue);
 
 // ── Start NFC ────────────────────────────────────
 async function startNFC() {
@@ -700,6 +715,11 @@ async function processPayment() {
                 `<strong>UGX ${amount.toLocaleString()}</strong> charged<br>
                  Balance left:
                  <strong>UGX ${data.remaining_balance.toLocaleString()}</strong>`;
+
+            // A charge just succeeded, so the network is evidently up —
+            // good moment to opportunistically drain anything still queued
+            // from an earlier outage. Fire-and-forget, doesn't block the UI.
+            flushOfflineQueue();
         } else {
             document.getElementById('result').className =
                 'result error';
@@ -711,7 +731,7 @@ async function processPayment() {
 
     } catch(e) {
         // Save offline
-        saveOffline(currentTagUid, amount);
+        saveOffline(currentTagUid, amount, currentRequestId);
         hide('studentCard');
         hide('amountSection');
         show('result');
@@ -737,16 +757,91 @@ function cancelPayment() {
 }
 
 // ── Save offline ──────────────────────────────────
-function saveOffline(tagUid, amount) {
+// request_id is the SAME id generated for this tap in onStudentTap() —
+// not a new one — so that if this exact charge actually reached the
+// server before the connection dropped, syncing it later is recognized
+// as a repeat instead of charging it a second time.
+function saveOffline(tagUid, amount, requestId) {
     const q = JSON.parse(
         localStorage.getItem('offlinePayments') || '[]'
     );
     q.push({
-        tag_uid:   tagUid,
-        amount:    amount,
-        timestamp: new Date().toISOString()
+        tag_uid:     tagUid,
+        amount:      amount,
+        request_id:  requestId,
+        merchant_id: MERCHANT_ID,
+        description: 'Tuck shop purchase (offline)',
+        timestamp:   new Date().toISOString()
     });
     localStorage.setItem('offlinePayments', JSON.stringify(q));
+    updateOfflineBadge();
+}
+
+function updateOfflineBadge() {
+    const queue = JSON.parse(localStorage.getItem('offlinePayments') || '[]');
+    const badge = document.getElementById('offlineBadge');
+    if (queue.length > 0) {
+        badge.textContent = `⚠ ${queue.length} offline payment${queue.length > 1 ? 's' : ''} waiting to sync`;
+        badge.style.display = 'block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+// ── Sync the offline queue back to the server ─────
+// Called on connectivity return, on page load once signed in, and
+// opportunistically after every successful online tap. Only removes an
+// item from the local queue once the server has explicitly accounted
+// for it (processed OR permanently failed) — if the request never gets
+// a response at all, the whole queue is left untouched to retry later.
+let flushingOfflineQueue = false;
+
+function getDeviceId() {
+    let id = localStorage.getItem('tsw_device_id');
+    if (!id) {
+        id = 'device-' + crypto.randomUUID();
+        localStorage.setItem('tsw_device_id', id);
+    }
+    return id;
+}
+
+async function flushOfflineQueue() {
+    if (flushingOfflineQueue || !TOKEN || !MERCHANT_ID) return;
+
+    const queue = JSON.parse(localStorage.getItem('offlinePayments') || '[]');
+    if (queue.length === 0) return;
+
+    flushingOfflineQueue = true;
+    try {
+        const res = await fetch(
+            `${API_BASE}/payments/sync?merchant_id=${MERCHANT_ID}&device_id=${encodeURIComponent(getDeviceId())}`,
+            {
+                method: 'POST',
+                headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+                body: JSON.stringify(queue),
+            }
+        );
+
+        if (res.status === 401) { sessionExpired(); return; }
+        if (!res.ok) return; // server-side error — leave the queue as-is, try again later
+
+        const data = await res.json();
+        const settled = new Set([
+            ...data.details.processed.map(p => p.request_id),
+            ...data.details.failed.map(f => f.request_id),
+        ]);
+        const remaining = queue.filter(item => !settled.has(item.request_id));
+        localStorage.setItem('offlinePayments', JSON.stringify(remaining));
+        updateOfflineBadge();
+
+        if (data.failed > 0) {
+            console.warn('Some offline payments could not be synced (permanent failures):', data.details.failed);
+        }
+    } catch (e) {
+        // Still offline / server unreachable — queue stays exactly as it was.
+    } finally {
+        flushingOfflineQueue = false;
+    }
 }
 
 // ── Reset ─────────────────────────────────────────

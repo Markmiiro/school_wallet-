@@ -8,6 +8,8 @@
 # POST /payments/sync.
 # ================================================
 
+import uuid
+
 from tests.conftest import make_student_with_wallet
 
 
@@ -54,7 +56,7 @@ def test_sync_rejects_negative_amount_for_that_item_only(client, db_session, sch
     r = client.post(
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
-        json=[{"tag_uid": nfc.tag_uid, "amount": -3000, "description": "bad"}],
+        json=[{"tag_uid": nfc.tag_uid, "amount": -3000, "request_id": str(uuid.uuid4()), "description": "bad"}],
         headers=auth_headers,
     )
     assert r.status_code == 200
@@ -72,7 +74,7 @@ def test_sync_rejects_zero_amount_for_that_item_only(client, db_session, school,
     r = client.post(
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
-        json=[{"tag_uid": nfc.tag_uid, "amount": 0, "description": "bad"}],
+        json=[{"tag_uid": nfc.tag_uid, "amount": 0, "request_id": str(uuid.uuid4()), "description": "bad"}],
         headers=auth_headers,
     )
     assert r.status_code == 200
@@ -90,8 +92,8 @@ def test_sync_processes_good_items_even_when_batch_has_a_bad_one(client, db_sess
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=[
-            {"tag_uid": nfc.tag_uid, "amount": -3000, "description": "bad"},
-            {"tag_uid": nfc.tag_uid, "amount": 1500, "description": "good"},
+            {"tag_uid": nfc.tag_uid, "amount": -3000, "request_id": str(uuid.uuid4()), "description": "bad"},
+            {"tag_uid": nfc.tag_uid, "amount": 1500, "request_id": str(uuid.uuid4()), "description": "good"},
         ],
         headers=auth_headers,
     )

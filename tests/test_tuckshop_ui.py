@@ -34,3 +34,29 @@ def test_merchant_school_lookup_used_by_the_page_is_public(client, merchant, sch
     r = client.get(f"/merchants/school/{school.id}")
     assert r.status_code == 200
     assert "merchants" in r.json()
+
+
+def test_page_queues_offline_payments_with_a_request_id(client):
+    # saveOffline() must save the SAME request_id generated at tap time
+    # (currentRequestId), not a fresh one — that's what makes a later
+    # sync of this item recognizable as a repeat if the original charge
+    # actually reached the server before the connection dropped.
+    body = client.get("/tuckshop/").text
+    assert "saveOffline(currentTagUid, amount, currentRequestId)" in body
+    assert "request_id:  requestId" in body
+
+
+def test_page_syncs_offline_queue_with_auth_and_drains_only_settled_items(client):
+    body = client.get("/tuckshop/").text
+    assert "function flushOfflineQueue" in body
+    assert "/payments/sync" in body
+    assert "...authHeaders()" in body  # the sync POST also carries the bearer token
+    # Only items the server explicitly settled (processed or failed) are
+    # removed from the local queue — anything else stays for next time.
+    assert "data.details.processed.map(p => p.request_id)" in body
+    assert "data.details.failed.map(f => f.request_id)" in body
+    assert "queue.filter(item => !settled.has(item.request_id))" in body
+    # Retriggers: connectivity return, page load once signed in, and
+    # opportunistically after a successful online tap.
+    assert "addEventListener('online', flushOfflineQueue)" in body
+    assert "flushOfflineQueue();" in body
