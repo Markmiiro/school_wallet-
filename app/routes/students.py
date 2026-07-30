@@ -1,5 +1,6 @@
 from typing import Optional
 import re
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -25,16 +26,22 @@ router = APIRouter()
 # without extra round trips.
 # ────────────────────────────────────────────────
 def student_payload(student: Student) -> dict:
-    nfc = student.nfc_tag
+    nfc = student.active_nfc_tag
 
-    if nfc is None:
-        nfc_status = "no card slot"
-        tag_uid = None
-    elif nfc.tag_uid:
-        nfc_status = "assigned" if nfc.is_active else "inactive"
+    if nfc is not None:
+        # active_nfc_tag is by definition is_active=True, so it's either
+        # a real card (tag_uid set) or the empty placeholder slot made
+        # at registration (tag_uid still None).
+        nfc_status = "assigned" if nfc.tag_uid else "not assigned"
         tag_uid = nfc.tag_uid
+    elif student.nfc_tags:
+        # No active card, but there's history — surface why (e.g. a card
+        # reported "stolen" or "lost" and not yet replaced) rather than
+        # lumping it in with "never had a card slot at all".
+        nfc_status = student.nfc_tags[0].status
+        tag_uid = None
     else:
-        nfc_status = "not assigned"
+        nfc_status = "no card slot"
         tag_uid = None
 
     return {
@@ -323,21 +330,41 @@ def assign_nfc_tag(
 
     uid = normalize_uid(tag_uid)
 
-    # Check this tag is not already used by someone else
+    # A tag_uid is a physical card's permanent identity. Once any row
+    # anywhere carries it — active, replaced, lost, or stolen — it can
+    # never be (re)assigned again, even back to the same student. This
+    # is what keeps a reported-stolen card permanently unusable.
     already_used = db.query(NFCTag).filter(NFCTag.tag_uid == uid).first()
-    if already_used and already_used.student_id != student_id:
+    if already_used:
         raise HTTPException(
             status_code=400,
-            detail=f"NFC tag {uid} is already assigned to another student"
+            detail=f"NFC tag {uid} has already been issued and cannot be reused"
         )
 
-    # Find this student's NFC slot and assign the tag
-    nfc = db.query(NFCTag).filter(NFCTag.student_id == student_id).first()
-    if not nfc:
-        raise HTTPException(status_code=404, detail="NFC slot not found for this student")
+    active = student.active_nfc_tag
 
-    nfc.tag_uid = uid
-    nfc.is_active = True          # a replacement card must arrive active
+    if active is None:
+        # No usable card right now — either this student has no nfc_tags
+        # row at all (shouldn't happen post-registration, but be safe),
+        # or their last card was reported stolen/lost. Either way, a
+        # brand new row for the new physical card.
+        nfc = NFCTag(student_id=student_id, tag_uid=uid, is_active=True, status="active")
+        db.add(nfc)
+    elif active.tag_uid is None:
+        # Empty placeholder from registration — never represented a real
+        # physical card, so fill it in place rather than spawning history.
+        active.tag_uid = uid
+        active.status = "active"
+    else:
+        # Swapping a working card for a new one (not a theft/loss report —
+        # see POST /students/{id}/report-stolen for that). Retire the old
+        # row and start a fresh one so the old tag_uid stays on record.
+        active.is_active = False
+        active.status = "replaced"
+        active.deactivated_at = datetime.utcnow()
+        nfc = NFCTag(student_id=student_id, tag_uid=uid, is_active=True, status="active")
+        db.add(nfc)
+
     db.commit()
 
     return {
@@ -376,9 +403,10 @@ def deactivate_student(
         wallet.is_active = False
 
     # And the card — a child who left should not have a live card in a drawer
-    nfc = db.query(NFCTag).filter(NFCTag.student_id == student_id).first()
+    nfc = student.active_nfc_tag
     if nfc:
         nfc.is_active = False
+        nfc.deactivated_at = datetime.utcnow()
 
     db.commit()
 
@@ -388,4 +416,58 @@ def deactivate_student(
         "wallet_deactivated": True,
         "card_deactivated": bool(nfc),
         "note": "Transaction history is preserved"
+    }
+
+
+# ================================================
+# POST /students/{student_id}/report-stolen
+# Immediately deactivate a student's current card.
+#
+# Callable by:
+#   - an admin scoped to the student's school (or a super admin)
+#   - the student's own parent
+# The wallet and balance are untouched — this only blocks the physical
+# card. Issue a replacement afterwards via PUT .../assign-nfc, which
+# (per the one-to-many NFCTag model) creates a fresh card row rather
+# than reviving this one; this tag_uid can never be reassigned.
+# ================================================
+@router.post("/{student_id}/report-stolen")
+def report_card_stolen(
+    student_id: int,
+    reason: str = "stolen",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Deactivate a student's current NFC card because it was lost or stolen."""
+    if reason not in ("stolen", "lost"):
+        raise HTTPException(status_code=422, detail='reason must be "stolen" or "lost"')
+
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    if current_user.role == "admin":
+        assert_school_access(current_user, student.school_id)
+    elif current_user.role == "parent":
+        if student.parent_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not permitted")
+    else:
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    nfc = student.active_nfc_tag
+    if nfc is None or nfc.tag_uid is None:
+        raise HTTPException(status_code=400, detail=f"{student.name} has no active card to report")
+
+    nfc.is_active = False
+    nfc.status = reason
+    nfc.deactivated_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "message": f"Card {nfc.tag_uid} reported {reason} and deactivated",
+        "student_id": student_id,
+        "student_name": student.name,
+        "tag_uid": nfc.tag_uid,
+        "status": reason,
+        "wallet_untouched": True,
     }

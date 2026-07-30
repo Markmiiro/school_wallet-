@@ -316,6 +316,12 @@ def nfc_payment(
             detail=f"NFC tag {tag_uid} not registered. Contact school admin."
         )
 
+    if not nfc.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This card has been deactivated ({nfc.status}). Contact school admin."
+        )
+
     # ── FIND WALLET ─────────────────────────────
     # with_for_update() locks this row until commit/rollback, so a second
     # concurrent tap against the same wallet blocks here instead of
@@ -531,6 +537,14 @@ def sync_offline_payments(
                     "tag_uid": tag_uid,
                     "amount": amount,
                     "reason": "NFC tag not registered"
+                })
+                continue
+
+            if not nfc.is_active:
+                failed.append({
+                    "tag_uid": tag_uid,
+                    "amount": amount,
+                    "reason": f"Card deactivated ({nfc.status})"
                 })
                 continue
 

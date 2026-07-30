@@ -80,10 +80,29 @@ class Student(Base):
     class_name     = Column(String, nullable=True)   # e.g. "P4", "S2"
 
     # Relationships
-    school  = relationship("School", back_populates="students")
-    parent  = relationship("User", back_populates="students")
-    wallet  = relationship("Wallet", back_populates="student", uselist=False)
-    nfc_tag = relationship("NFCTag", back_populates="student", uselist=False)
+    school   = relationship("School", back_populates="students")
+    parent   = relationship("User", back_populates="students")
+    wallet   = relationship("Wallet", back_populates="student", uselist=False)
+    # One-to-many: a student accumulates a NFCTag row per physical card
+    # issued to them over time (see NFCTag below). Use
+    # student.active_nfc_tag (a property, defined further down) to get
+    # the one currently usable card — never assume nfc_tags[0] is it.
+    nfc_tags = relationship(
+        "NFCTag", back_populates="student", order_by="NFCTag.id.desc()"
+    )
+
+    @property
+    def active_nfc_tag(self):
+        """The one card currently usable by this student, or None.
+
+        At most one row in nfc_tags should have is_active=True at a time
+        (report-card-stolen and reissue-on-replace enforce this), but this
+        takes the most recent match defensively rather than assuming it.
+        """
+        for tag in self.nfc_tags:
+            if tag.is_active:
+                return tag
+        return None
 
 
 # ════════════════════════════════════════════════
@@ -133,31 +152,48 @@ class Transaction(Base):
 
 # ════════════════════════════════════════════════
 # NFC TAGS
-# One NFC card per student — this row IS the physical card.
-# tag_uid is the physical card's unique ID.
+# One row per physical card ever issued to a student — this row IS the
+# physical card. tag_uid is the physical card's unique ID. A student can
+# accumulate several rows over time (one-to-many, see Student.nfc_tags
+# above); old rows are never deleted or overwritten, so the tag_uid of a
+# lost/stolen card stays on permanent record and can never be reissued
+# to anyone.
+#
+# is_active: whether THIS card can currently be used to spend. Checked
+# by app/routes/payments.py's nfc_payment() (and the /sync offline
+# path) at charge time, in addition to Wallet.is_active.
+#
+# status: why is_active is what it is — "active" | "stolen" | "lost" |
+# "replaced" (superseded by a newer card, no theft/loss involved).
+# Purely a history/audit field; is_active is what every check enforces.
+#
+# deactivated_at: when this row stopped being active. NULL while active.
 #
 # card_color: the colour the parent chose when buying the card
 # (Blue | Green | Yellow | Red — the four approved by Yo Uganda
 # in the USSD registration flow). Lives here rather than on
 # Student because it is a property of the card, not the child.
 #
-# NOTE: this is currently a strict one-to-one with Student
-# (uselist=False). If card replacement history is needed later
-# (lost card -> new card, keeping the old record), this would
-# need to become one-to-many — which touches every caller that
-# does student.nfc_tag.
+# MIGRATION NOTE: status and deactivated_at are new columns. create_all()
+# does not retroactively ALTER an existing table (see the Payment model's
+# note below for the same caveat) — a deployed database needs, by hand:
+#   ALTER TABLE nfc_tags ADD COLUMN status VARCHAR NOT NULL DEFAULT 'active';
+#   ALTER TABLE nfc_tags ADD COLUMN deactivated_at TIMESTAMP;
+# Not run here — no DDL against any live database from this session.
 # ════════════════════════════════════════════════
 class NFCTag(Base):
     __tablename__ = "nfc_tags"
 
-    id         = Column(Integer, primary_key=True, index=True)
-    tag_uid    = Column(String, unique=True, nullable=True)
-    is_active  = Column(Boolean, default=True)
-    card_color = Column(String, nullable=True)   # Blue | Green | Yellow | Red
-    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    id             = Column(Integer, primary_key=True, index=True)
+    tag_uid        = Column(String, unique=True, nullable=True)
+    is_active      = Column(Boolean, default=True)
+    status         = Column(String, nullable=False, default="active")
+    deactivated_at = Column(DateTime, nullable=True)
+    card_color     = Column(String, nullable=True)   # Blue | Green | Yellow | Red
+    student_id     = Column(Integer, ForeignKey("students.id"), nullable=False)
 
     # Relationships
-    student = relationship("Student", back_populates="nfc_tag")
+    student = relationship("Student", back_populates="nfc_tags")
 
 
 # ════════════════════════════════════════════════

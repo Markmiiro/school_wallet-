@@ -95,6 +95,12 @@ def create_tables():
     # Lives on the card record, not the student.
     add_column_if_missing("nfc_tags",     "card_color",  "VARCHAR")
 
+    # Lost/stolen-card support: NFCTag went from one-to-one with Student
+    # to one-to-many (see app/models.py). status/deactivated_at record
+    # why and when a given physical card stopped being usable.
+    add_column_if_missing("nfc_tags",     "status",         "VARCHAR NOT NULL DEFAULT 'active'")
+    add_column_if_missing("nfc_tags",     "deactivated_at", "TIMESTAMP")
+
     print("All columns verified")
 
 

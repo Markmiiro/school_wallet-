@@ -88,7 +88,7 @@ def db_session():
 
 # ── Minimal app: only the routers the money-critical tests need ──
 def _build_test_app():
-    from app.routes import payments, tuckshop, merchants, webhook, auth as auth_routes
+    from app.routes import payments, tuckshop, merchants, webhook, auth as auth_routes, students
 
     app = FastAPI()
     app.include_router(payments.router, prefix="/payments", tags=["Payments"])
@@ -96,6 +96,7 @@ def _build_test_app():
     app.include_router(merchants.router, prefix="/merchants", tags=["Merchants"])
     app.include_router(webhook.router, prefix="/webhook", tags=["Webhook"])
     app.include_router(auth_routes.router, prefix="/auth", tags=["Authentication"])
+    app.include_router(students.router, prefix="/students", tags=["Students"])
     return app
 
 
@@ -211,6 +212,32 @@ def auth_headers(parent_user):
         user_id=parent_user.id, role=parent_user.role, phone=parent_user.phone,
     )
     return {"Authorization": f"Bearer {token}"}
+
+
+def make_admin(db_session, school, *, phone):
+    u = models.User(
+        name="Test Admin", phone=phone, role="admin",
+        pin_hash=hash_pin("1234"), school_id=school.id,
+    )
+    db_session.add(u)
+    db_session.commit()
+    db_session.refresh(u)
+    return u
+
+
+def headers_for(user):
+    token = create_access_token(user_id=user.id, role=user.role, phone=user.phone)
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture()
+def admin_user(db_session, school):
+    return make_admin(db_session, school, phone="256700999001")
+
+
+@pytest.fixture()
+def admin_headers(admin_user):
+    return headers_for(admin_user)
 
 
 # ── Yo webhook signature verification ──────────────────
