@@ -493,14 +493,22 @@ def sync_offline_payments(
         {
             "tag_uid": "A3F2B1C4",
             "amount": 2000,
+            "request_id": "a client-generated UUID, one per original tap",
             "description": "Lunch",
             "timestamp": "2026-05-14T10:30:00"
         },
         ...
     ]
 
+    request_id is required and is the same idempotency key /payments/nfc
+    uses (see Payment.reference below) — a device that resends a batch
+    it's unsure reached the server (lost response, retried sync) must not
+    have any item in it charged twice.
+
     Server processes each one and returns:
-    - processed: list of successful payments
+    - processed: list of successful payments (includes ones that were
+      already synced before — same request_id, reported again rather
+      than charged again)
     - failed: list of failed payments with reasons
     """
     from app.models import NFCTag
@@ -512,17 +520,28 @@ def sync_offline_payments(
     print(f"   {len(payments)} payments to process")
 
     for payment in payments:
-        tag_uid     = payment.get("tag_uid")
-        amount      = payment.get("amount")
-        description = payment.get("description", "Offline payment")
+        tag_uid      = payment.get("tag_uid")
+        amount       = payment.get("amount")
+        request_id   = payment.get("request_id")
+        description  = payment.get("description", "Offline payment")
         offline_time = payment.get("timestamp")
 
         try:
+            if not request_id:
+                failed.append({
+                    "tag_uid": tag_uid,
+                    "amount": amount,
+                    "request_id": request_id,
+                    "reason": "Missing request_id — cannot sync safely"
+                })
+                continue
+
             # Amount must be positive
             if not isinstance(amount, (int, float)) or amount <= 0:
                 failed.append({
                     "tag_uid": tag_uid,
                     "amount": amount,
+                    "request_id": request_id,
                     "reason": "Amount must be greater than zero"
                 })
                 continue
@@ -536,6 +555,7 @@ def sync_offline_payments(
                 failed.append({
                     "tag_uid": tag_uid,
                     "amount": amount,
+                    "request_id": request_id,
                     "reason": "NFC tag not registered"
                 })
                 continue
@@ -544,6 +564,7 @@ def sync_offline_payments(
                 failed.append({
                     "tag_uid": tag_uid,
                     "amount": amount,
+                    "request_id": request_id,
                     "reason": f"Card deactivated ({nfc.status})"
                 })
                 continue
@@ -560,7 +581,26 @@ def sync_offline_payments(
                 failed.append({
                     "tag_uid": tag_uid,
                     "amount": amount,
+                    "request_id": request_id,
                     "reason": "Wallet not found or deactivated"
+                })
+                continue
+
+            # ── IDEMPOTENCY CHECK ────────────────────
+            # Runs AFTER the wallet row lock above, for the same reason as
+            # /payments/nfc: a genuine concurrent resync of this exact
+            # request_id blocks on that lock, then lands here and sees the
+            # now-committed Payment row instead of racing past this check.
+            existing_payment = db.query(Payment).filter(Payment.reference == request_id).first()
+            if existing_payment:
+                existing_txn = db.query(Transaction).filter(Transaction.reference == request_id).first()
+                processed.append({
+                    "tag_uid": tag_uid,
+                    "amount": existing_payment.amount,
+                    "request_id": request_id,
+                    "transaction_id": existing_txn.id if existing_txn else None,
+                    "status": "completed",
+                    "already_synced": True,
                 })
                 continue
 
@@ -569,7 +609,36 @@ def sync_offline_payments(
                 failed.append({
                     "tag_uid": tag_uid,
                     "amount": amount,
+                    "request_id": request_id,
                     "reason": f"Insufficient balance: UGX {wallet.balance:,}"
+                })
+                continue
+
+            # Check daily limit — same rule as the live tap-to-pay path.
+            # "Today" here is sync time, not the original offline tap time
+            # (the Transaction rows it's compared against are timestamped
+            # at sync/commit time too, same as the rest of this endpoint).
+            today = date.today()
+            spent_today = (
+                db.query(Transaction)
+                .filter(
+                    Transaction.wallet_id == wallet.id,
+                    Transaction.type == "payment",
+                    Transaction.status == "completed",
+                )
+                .all()
+            )
+            total_spent_today = sum(
+                t.amount for t in spent_today
+                if t.timestamp and t.timestamp.date() == today
+            )
+            if wallet.daily_limit and (total_spent_today + amount) > wallet.daily_limit:
+                remaining = wallet.daily_limit - total_spent_today
+                failed.append({
+                    "tag_uid": tag_uid,
+                    "amount": amount,
+                    "request_id": request_id,
+                    "reason": f"Daily limit exceeded. Remaining: UGX {remaining:,}"
                 })
                 continue
 
@@ -582,16 +651,46 @@ def sync_offline_payments(
                 amount=amount,
                 type="payment",
                 status="completed",
+                reference=request_id,
                 description=f"[OFFLINE] {description}",
                 timestamp=datetime.utcnow(),
             )
             db.add(txn)
-            db.commit()
-            db.refresh(txn)
+
+            # Idempotency ledger — same table/pattern /payments/nfc uses.
+            db.add(Payment(
+                wallet_id=wallet.id,
+                amount=amount,
+                status="completed",
+                reference=request_id,
+            ))
+
+            try:
+                db.commit()
+                db.refresh(txn)
+            except IntegrityError:
+                # A concurrent sync with this exact request_id committed
+                # first — belt-and-suspenders, since the wallet row lock
+                # above should already prevent this for same-wallet
+                # duplicates. Roll back this attempt and report it as
+                # already processed rather than double-charging.
+                db.rollback()
+                db.refresh(wallet)
+                existing_txn = db.query(Transaction).filter(Transaction.reference == request_id).first()
+                processed.append({
+                    "tag_uid": tag_uid,
+                    "amount": existing_txn.amount if existing_txn else amount,
+                    "request_id": request_id,
+                    "transaction_id": existing_txn.id if existing_txn else None,
+                    "status": "completed",
+                    "already_synced": True,
+                })
+                continue
 
             processed.append({
                 "tag_uid": tag_uid,
                 "amount": amount,
+                "request_id": request_id,
                 "transaction_id": txn.id,
                 "status": "completed"
             })
@@ -621,6 +720,7 @@ def sync_offline_payments(
             failed.append({
                 "tag_uid": tag_uid,
                 "amount": amount,
+                "request_id": request_id,
                 "reason": str(e)
             })
 
