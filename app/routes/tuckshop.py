@@ -16,10 +16,10 @@ def tuckshop_interface():
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
     <title>🏪 Tuck Shop</title>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 
         body {
             font-family: Arial, sans-serif;
@@ -47,8 +47,46 @@ def tuckshop_interface():
             margin-bottom: 30px;
         }
 
+        /* ── LOGIN ── */
+        .login-wrap { width: 100%; max-width: 340px; }
+        .field { margin-bottom: 14px; text-align: left; }
+        .field label {
+            display: block; font-size: 12px; color: #aaa; margin-bottom: 5px;
+        }
+        .field input, .field select {
+            width: 100%; padding: 14px; font-size: 16px; border-radius: 10px;
+            border: 2px solid #0f3460; background: #0f3460; color: white;
+            outline: none;
+        }
+        .field input:focus, .field select:focus { border-color: #00d4aa; }
+        .login-btn {
+            width: 100%; padding: 16px; font-size: 17px; font-weight: bold;
+            border: none; border-radius: 12px; background: #00d4aa;
+            color: #1a1a2e; cursor: pointer; margin-top: 4px;
+        }
+        .login-btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+        .login-err {
+            background: #ff444422; border: 1px solid #ff4444; color: #ff9b9b;
+            padding: 11px 13px; border-radius: 10px; font-size: 13.5px;
+            line-height: 1.45; margin-bottom: 14px; display: none;
+        }
+        .login-err.show { display: block; }
+        .login-note { color: #666; font-size: 12px; text-align: center; margin-top: 16px; }
+
+        /* ── SESSION BAR (shown once signed in) ── */
+        .session-bar {
+            width: 100%; max-width: 380px; display: flex;
+            justify-content: space-between; align-items: center;
+            margin-bottom: 4px; font-size: 12px; color: #888;
+        }
+        .session-bar .who { color: #aaa; }
+        .session-bar .signout {
+            color: #888; border: 1px solid #333; padding: 5px 10px;
+            border-radius: 99px; cursor: pointer;
+        }
+
         /* ── WAITING SCREEN ── */
-        .screen { width: 100%; max-width: 380px; }
+        .screen { width: 100%; max-width: 380px; display: none; }
 
         .waiting {
             text-align: center;
@@ -261,102 +299,290 @@ def tuckshop_interface():
 </head>
 <body>
 
-<h1>🏪 School Wallet</h1>
-<p class="sub">Tuck Shop Terminal</p>
+<!-- ══ LOGIN ══ -->
+<div id="loginBlock">
+    <h1>🏪 School Wallet</h1>
+    <p class="sub">Tuck Shop Terminal — staff sign in</p>
+    <div class="login-wrap">
+        <div class="login-err" id="loginErr"></div>
+        <div class="field">
+            <label>Phone number</label>
+            <input type="tel" id="phone" placeholder="256700000001" autocomplete="username">
+        </div>
+        <div class="field">
+            <label>PIN</label>
+            <input type="password" id="pin" inputmode="numeric" placeholder="••••" autocomplete="current-password">
+        </div>
+        <button class="login-btn" id="loginBtn" onclick="doLogin()">Sign in</button>
+        <p class="login-note">Tuck shop staff or admin account.</p>
+    </div>
+</div>
 
-<div class="screen">
+<!-- ══ MERCHANT PICKER (only shown if a school has more than one tuck shop) ══ -->
+<div id="pickerBlock" style="display:none">
+    <h1>🏪 School Wallet</h1>
+    <p class="sub">Which tuck shop is this device for?</p>
+    <div class="login-wrap">
+        <div class="login-err" id="pickerErr"></div>
+        <div class="field">
+            <label>Tuck shop</label>
+            <select id="merchantSelect"></select>
+        </div>
+        <button class="login-btn" onclick="confirmMerchant()">Continue</button>
+    </div>
+</div>
 
-    <!-- NFC not supported -->
-    <div class="nfc-warning" id="nfcWarning">
-        <p style="font-size:40px">📵</p>
-        <p style="font-weight:bold; margin-top:10px">NFC Not Available</p>
-        <p style="color:#aaa; font-size:14px; margin-top:8px">
-            Please use an Android phone with NFC enabled
-            and open this page in Chrome browser.
-        </p>
+<!-- ══ APP ══ -->
+<div id="appBlock" style="display:none; width:100%; display:flex; flex-direction:column; align-items:center">
+    <div class="session-bar">
+        <span class="who" id="who"></span>
+        <span class="signout" onclick="logout()">Sign out</span>
     </div>
 
-    <!-- Waiting for tap -->
-    <div class="waiting" id="waiting">
-        <span class="tap-icon">📡</span>
-        <h2>Ready for Payment</h2>
-        <p>Ask student to tap their bracelet</p>
-    </div>
+    <h1>🏪 School Wallet</h1>
+    <p class="sub">Tuck Shop Terminal</p>
 
-    <!-- Student card -->
-    <div class="student-card" id="studentCard">
-        <div class="student-name"    id="studentName">-</div>
-        <div class="student-balance" id="studentBalance">UGX 0</div>
-        <div class="balance-label">Available balance</div>
-    </div>
+    <div class="screen" id="mainScreen" style="display:block">
 
-    <!-- Amount entry -->
-    <div class="amount-section" id="amountSection">
-        <label>💰 Enter amount (UGX):</label>
-
-        <!-- Quick amount shortcuts -->
-        <div class="quick-amounts">
-            <button class="quick-btn" onclick="setAmount(500)">500</button>
-            <button class="quick-btn" onclick="setAmount(1000)">1,000</button>
-            <button class="quick-btn" onclick="setAmount(1500)">1,500</button>
-            <button class="quick-btn" onclick="setAmount(2000)">2,000</button>
-            <button class="quick-btn" onclick="setAmount(2500)">2,500</button>
-            <button class="quick-btn" onclick="setAmount(3000)">3,000</button>
-            <button class="quick-btn" onclick="setAmount(4000)">4,000</button>
-            <button class="quick-btn" onclick="setAmount(5000)">5,000</button>
+        <!-- NFC not supported -->
+        <div class="nfc-warning" id="nfcWarning">
+            <p style="font-size:40px">📵</p>
+            <p style="font-weight:bold; margin-top:10px">NFC Not Available</p>
+            <p style="color:#aaa; font-size:14px; margin-top:8px">
+                Please use an Android phone with NFC enabled
+                and open this page in Chrome browser.
+            </p>
         </div>
 
-        <!-- Or type custom amount -->
-        <input
-            type="number"
-            id="amountInput"
-            class="amount-input"
-            placeholder="0"
-            min="100"
-            inputmode="numeric"
-        />
+        <!-- Waiting for tap -->
+        <div class="waiting" id="waiting">
+            <span class="tap-icon">📡</span>
+            <h2>Ready for Payment</h2>
+            <p>Ask student to tap their bracelet</p>
+        </div>
 
-        <button class="pay-btn" id="payBtn" onclick="processPayment()">
-            💳 Charge
-        </button>
+        <!-- Student card -->
+        <div class="student-card" id="studentCard">
+            <div class="student-name"    id="studentName">-</div>
+            <div class="student-balance" id="studentBalance">UGX 0</div>
+            <div class="balance-label">Available balance</div>
+        </div>
 
-        <button class="cancel-btn" onclick="cancelPayment()">
-            ✕ Cancel
-        </button>
+        <!-- Amount entry -->
+        <div class="amount-section" id="amountSection">
+            <label>💰 Enter amount (UGX):</label>
+
+            <!-- Quick amount shortcuts -->
+            <div class="quick-amounts">
+                <button class="quick-btn" onclick="setAmount(500)">500</button>
+                <button class="quick-btn" onclick="setAmount(1000)">1,000</button>
+                <button class="quick-btn" onclick="setAmount(1500)">1,500</button>
+                <button class="quick-btn" onclick="setAmount(2000)">2,000</button>
+                <button class="quick-btn" onclick="setAmount(2500)">2,500</button>
+                <button class="quick-btn" onclick="setAmount(3000)">3,000</button>
+                <button class="quick-btn" onclick="setAmount(4000)">4,000</button>
+                <button class="quick-btn" onclick="setAmount(5000)">5,000</button>
+            </div>
+
+            <!-- Or type custom amount -->
+            <input
+                type="number"
+                id="amountInput"
+                class="amount-input"
+                placeholder="0"
+                min="100"
+                inputmode="numeric"
+            />
+
+            <button class="pay-btn" id="payBtn" onclick="processPayment()">
+                💳 Charge
+            </button>
+
+            <button class="cancel-btn" onclick="cancelPayment()">
+                ✕ Cancel
+            </button>
+        </div>
+
+        <!-- Result -->
+        <div class="result" id="result">
+            <div class="result-icon"   id="resultIcon">✅</div>
+            <div class="result-title"  id="resultTitle">Done!</div>
+            <div class="result-detail" id="resultDetail"></div>
+            <button class="next-btn" onclick="resetForNext()">
+                Next Student →
+            </button>
+        </div>
+
+        <div class="merchant-tag" id="merchantTag">Loading...</div>
+
     </div>
-
-    <!-- Result -->
-    <div class="result" id="result">
-        <div class="result-icon"   id="resultIcon">✅</div>
-        <div class="result-title"  id="resultTitle">Done!</div>
-        <div class="result-detail" id="resultDetail"></div>
-        <button class="next-btn" onclick="resetForNext()">
-            Next Student →
-        </button>
-    </div>
-
-    <div class="merchant-tag" id="merchantTag">Loading...</div>
-
 </div>
 
 <script>
-const API_BASE    = window.location.origin;
-const MERCHANT_ID = 1; // Set this per device
+const API_BASE = window.location.origin;
 
+let TOKEN = null, ME = null, MERCHANT_ID = null, MERCHANT_NAME = null;
 let currentTagUid = null;
 let currentRequestId = null;   // one UUID per tap; sent with the charge so a
                                 // retry of this exact attempt doesn't double-charge
 
-// ── Load merchant name ───────────────────────────
-window.onload = async function() {
+const authHeaders = () => ({ 'Authorization': 'Bearer ' + TOKEN });
+
+// ══ LOGIN ═══════════════════════════════════════
+function showLoginErr(msg) {
+    const e = document.getElementById('loginErr');
+    e.textContent = msg;
+    e.classList.add('show');
+}
+
+async function doLogin() {
+    const btn   = document.getElementById('loginBtn');
+    const phone = document.getElementById('phone').value.trim();
+    const pin   = document.getElementById('pin').value.trim();
+    document.getElementById('loginErr').classList.remove('show');
+
+    if (!phone || !pin) { showLoginErr('Enter both phone number and PIN.'); return; }
+
+    btn.disabled = true; btn.textContent = 'Signing in…';
     try {
-        const res  = await fetch(`${API_BASE}/merchants/${MERCHANT_ID}`);
-        const data = await res.json();
-        document.getElementById('merchantTag').textContent =
-            `🏪 ${data.name}`;
-    } catch(e) {
-        document.getElementById('merchantTag').textContent = '🏪 Tuck Shop';
+        const res = await fetch(API_BASE + '/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone, pin })
+        });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+            showLoginErr(data.detail || ('Sign in failed (' + res.status + ')'));
+            return;
+        }
+        if (!data.token) { showLoginErr('Server did not return a token.'); return; }
+
+        // Cosmetic only — the money routes enforce their own auth
+        // server-side regardless of what this page shows.
+        if (data.user && !['merchant', 'admin'].includes(data.user.role)) {
+            showLoginErr(`This device is for tuck shop staff. You are signed in as "${data.user.role}".`);
+            return;
+        }
+
+        TOKEN = data.token;
+        ME    = data.user || null;
+        sessionStorage.setItem('tsw_token', TOKEN);
+        sessionStorage.setItem('tsw_user', JSON.stringify(ME));
+        sessionStorage.removeItem('tsw_merchant'); // fresh login re-picks the tuck shop
+        await afterLogin();
+    } catch (e) {
+        showLoginErr('Network error — check the connection and try again.');
+    } finally {
+        btn.disabled = false; btn.textContent = 'Sign in';
     }
+}
+
+document.getElementById('pin').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doLogin();
+});
+
+function logout() {
+    sessionStorage.removeItem('tsw_token');
+    sessionStorage.removeItem('tsw_user');
+    sessionStorage.removeItem('tsw_merchant');
+    location.reload();
+}
+
+function sessionExpired() {
+    sessionStorage.removeItem('tsw_token');
+    TOKEN = null;
+    document.getElementById('appBlock').style.display = 'none';
+    document.getElementById('pickerBlock').style.display = 'none';
+    document.getElementById('loginBlock').style.display = 'block';
+    showLoginErr('Session expired — sign in again to continue.');
+}
+
+// Token lasts 24h; a stale one just bounces back to login on first 401.
+(function restore() {
+    const t = sessionStorage.getItem('tsw_token');
+    if (!t) return;
+    TOKEN = t;
+    try { ME = JSON.parse(sessionStorage.getItem('tsw_user') || 'null'); } catch (e) {}
+    afterLogin();
+})();
+
+// ══ MERCHANT (TUCK SHOP) SELECTION ═══════════════
+async function afterLogin() {
+    document.getElementById('loginBlock').style.display = 'none';
+
+    const savedMerchant = sessionStorage.getItem('tsw_merchant');
+    if (savedMerchant) {
+        const m = JSON.parse(savedMerchant);
+        MERCHANT_ID = m.id;
+        MERCHANT_NAME = m.name;
+        enterApp();
+        return;
+    }
+
+    if (!ME || !ME.school_id) {
+        document.getElementById('pickerBlock').style.display = 'block';
+        document.getElementById('pickerErr').textContent =
+            'Your account has no school attached — ask an admin to fix this before using the till.';
+        document.getElementById('pickerErr').classList.add('show');
+        return;
+    }
+
+    try {
+        const res = await fetch(`${API_BASE}/merchants/school/${ME.school_id}`, { headers: authHeaders() });
+        if (res.status === 401) { sessionExpired(); return; }
+        const data = await res.json();
+        const merchants = (data.merchants || []).map(m => ({ ...m, school_id: ME.school_id }));
+
+        if (merchants.length === 0) {
+            document.getElementById('pickerBlock').style.display = 'block';
+            document.getElementById('pickerErr').textContent =
+                'No tuck shop is set up for your school yet — ask an admin to add one.';
+            document.getElementById('pickerErr').classList.add('show');
+            return;
+        }
+
+        if (merchants.length === 1) {
+            MERCHANT_ID = merchants[0].id;
+            MERCHANT_NAME = merchants[0].name;
+            sessionStorage.setItem('tsw_merchant', JSON.stringify(merchants[0]));
+            enterApp();
+            return;
+        }
+
+        // More than one tuck shop at this school — ask which one this device is for.
+        const select = document.getElementById('merchantSelect');
+        select.innerHTML = merchants.map(m => `<option value="${m.id}">${escapeHtml(m.name)}</option>`).join('');
+        select.dataset.merchants = JSON.stringify(merchants);
+        document.getElementById('pickerBlock').style.display = 'block';
+    } catch (e) {
+        document.getElementById('pickerBlock').style.display = 'block';
+        document.getElementById('pickerErr').textContent = 'Could not load tuck shops — check the connection.';
+        document.getElementById('pickerErr').classList.add('show');
+    }
+}
+
+function confirmMerchant() {
+    const select = document.getElementById('merchantSelect');
+    const merchants = JSON.parse(select.dataset.merchants || '[]');
+    const picked = merchants.find(m => String(m.id) === select.value);
+    if (!picked) return;
+    MERCHANT_ID = picked.id;
+    MERCHANT_NAME = picked.name;
+    sessionStorage.setItem('tsw_merchant', JSON.stringify(picked));
+    document.getElementById('pickerBlock').style.display = 'none';
+    enterApp();
+}
+
+function escapeHtml(s) {
+    return String(s ?? '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+}
+
+// ══ APP ═══════════════════════════════════════════
+function enterApp() {
+    document.getElementById('appBlock').style.display = 'flex';
+    document.getElementById('who').textContent = ME ? `${ME.name} · ${ME.role}` : '';
+    document.getElementById('merchantTag').textContent = `🏪 ${MERCHANT_NAME || 'Tuck Shop'}`;
     startNFC();
 }
 
@@ -448,8 +674,15 @@ async function processPayment() {
             `${API_BASE}/payments/nfc?tag_uid=${currentTagUid}` +
             `&merchant_id=${MERCHANT_ID}&amount=${amount}` +
             `&description=Tuck shop purchase&request_id=${currentRequestId}`,
-            { method: 'POST' }
+            { method: 'POST', headers: authHeaders() }
         );
+
+        if (res.status === 401) {
+            sessionExpired();
+            payBtn.disabled = false; payBtn.textContent = '💳 Charge';
+            return;
+        }
+
         const data = await res.json();
 
         hide('studentCard');
