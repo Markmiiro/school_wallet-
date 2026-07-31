@@ -158,16 +158,17 @@ async def yo_uganda_ipn(request: Request, db: Session = Depends(get_db)):
 
     # ---------------- USSD registration (new Smart Card) ----------------
     if tx_ref.startswith("USSD-REG-"):
-        existing = db.query(Transaction).filter(Transaction.reference == tx_ref).first()
-        if existing:
-            return {"message": f"Registration already processed: {existing.status}"}
-
         pending = (
             db.query(PendingUssdRegistration)
             .filter(PendingUssdRegistration.reference == tx_ref)
+            .with_for_update()
             .first()
         )
+
         if not pending:
+            existing = db.query(Transaction).filter(Transaction.reference == tx_ref).first()
+            if existing:
+                return {"message": f"Registration already processed: {existing.status}"}
             print(f"[Yo IPN] No pending registration found for {tx_ref}")
             return {"message": "Pending registration not found"}
 
@@ -262,6 +263,16 @@ async def yo_uganda_ipn(request: Request, db: Session = Depends(get_db)):
             print(f"[Yo IPN] Could not parse USSD-TOPUP ref parts: {tx_ref}")
             return {"message": "Could not parse USSD-TOPUP reference"}
 
+        wallet = (
+            db.query(Wallet)
+            .filter(Wallet.student_id == ussd_student_id)
+            .with_for_update()
+            .first()
+        )
+        if not wallet:
+            print(f"[Yo IPN] USSD-TOPUP: wallet not found for student {ussd_student_id}")
+            return {"message": "Wallet not found"}
+
         existing = db.query(Transaction).filter(Transaction.reference == tx_ref).first()
         if existing:
             return {"message": f"USSD top-up already processed: {existing.status}"}
@@ -269,11 +280,6 @@ async def yo_uganda_ipn(request: Request, db: Session = Depends(get_db)):
         if amount != ussd_amount:
             print(f"[Yo IPN] Amount mismatch for {tx_ref}: IPN={amount} ref={ussd_amount}")
             return {"message": "Amount mismatch — not credited"}
-
-        wallet = db.query(Wallet).filter(Wallet.student_id == ussd_student_id).first()
-        if not wallet:
-            print(f"[Yo IPN] USSD-TOPUP: wallet not found for student {ussd_student_id}")
-            return {"message": "Wallet not found"}
 
         wallet.balance += ussd_amount
         db.add(Transaction(
@@ -306,7 +312,12 @@ async def yo_uganda_ipn(request: Request, db: Session = Depends(get_db)):
         return {"message": "USSD top-up credited successfully"}
 
     # ---------------- Regular top-up (pre-created Transaction) ----------------
-    txn = db.query(Transaction).filter(Transaction.reference == tx_ref).first()
+    txn = (
+        db.query(Transaction)
+        .filter(Transaction.reference == tx_ref)
+        .with_for_update()
+        .first()
+    )
     if not txn:
         return {"message": f"Transaction not found: {tx_ref}"}
 
