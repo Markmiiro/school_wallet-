@@ -11,9 +11,9 @@
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
-from typing import Optional
 
 from app.database import get_db
 from app.models import User
@@ -35,11 +35,20 @@ class LoginRequest(BaseModel):
     pin: str
 
 class RegisterRequest(BaseModel):
+    """
+    Public self-signup — parent accounts only. `role` and `school_id`
+    are deliberately not fields here: admin/merchant accounts are
+    created exclusively through an authenticated-admin action, never by
+    an unauthenticated caller choosing their own role. Any `role` or
+    `school_id` a client sends is silently ignored (extra="ignore"),
+    not validated-and-rejected, so this can't break existing clients
+    that still send one.
+    """
+    model_config = {"extra": "ignore"}
+
     name: str
     phone: str
     pin: str
-    role: str
-    school_id: Optional[int] = None
 
     @field_validator("pin")
     def pin_must_be_4_digits(cls, v):
@@ -52,12 +61,6 @@ class RegisterRequest(BaseModel):
         v = v.replace(" ", "").replace("+", "")
         if not v.startswith("256") or len(v) != 12:
             raise ValueError("Phone must be 256XXXXXXXXX format")
-        return v
-
-    @field_validator("role")
-    def role_must_be_valid(cls, v):
-        if v not in ["parent", "admin", "merchant"]:
-            raise ValueError("Role must be parent, admin, or merchant")
         return v
 
 class ChangePinRequest(BaseModel):
@@ -169,10 +172,12 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
 @router.post("/register")
 def register(data: RegisterRequest, db: Session = Depends(get_db)):
     """
-    Register a new user with a hashed PIN.
-    Role must be: parent, admin, or merchant
+    Public self-signup. Always creates a parent account — see
+    RegisterRequest's docstring for why role/school_id aren't inputs.
     """
-    # Check phone not already registered
+    # Check phone not already registered (fast path; the try/except
+    # below is what actually protects against a concurrent duplicate,
+    # since this check-then-act has a race window of its own).
     existing = db.query(User).filter(
         User.phone == data.phone
     ).first()
@@ -188,11 +193,20 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         name=data.name,
         phone=data.phone,
         pin_hash=hash_pin(data.pin),
-        role=data.role,
-        school_id=data.school_id,
+        role="parent",
+        school_id=None,
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Another request registered this same phone number in the
+        # window between the check above and this commit.
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="This phone number is already registered."
+        )
     db.refresh(user)
 
     # Create token immediately so they are logged in
