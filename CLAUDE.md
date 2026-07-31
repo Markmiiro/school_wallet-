@@ -121,6 +121,11 @@ under duplicate/rapid callbacks. Use a dedicated test database.
 - Withdraw signing awaiting Yo enabling our public key on sandbox.
 - Two near-duplicate school rows exist (ids 1 and 2).
 - Near-zero automated tests currently exist — that's the main gap you're helping close.
+- Live `payments` table is missing a `timestamp` column that `Payment` (app/models.py)
+  declares — found 2026-07-31 while auditing `payments.reference` for duplicates.
+  `create_all()` never retroactively alters an existing table, so the live table
+  predates that field. Needs reconciliation (add the column live) — not done yet,
+  flagged only.
 
 ---
 

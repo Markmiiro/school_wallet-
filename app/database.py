@@ -111,6 +111,15 @@ def create_tables():
     # here is logged loudly rather than swallowed.
     add_unique_constraint_if_missing("transactions", "reference", "uq_transactions_reference")
 
+    # payments.py's nfc_payment()/sync_offline_payments() idempotency
+    # backstop (behind the wallet row lock) depends on this constraint —
+    # see the Payment model's comment in app/models.py. Audit production
+    # for pre-existing duplicate references before this runs against it
+    # for the first time (see the duplicate-audit query given alongside
+    # this change) — same reasoning as the transactions.reference case
+    # above.
+    add_unique_constraint_if_missing("payments", "reference", "uq_payments_reference")
+
 
 def add_column_if_missing(table: str, column: str, col_type: str):
     """
