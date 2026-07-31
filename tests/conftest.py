@@ -88,7 +88,7 @@ def db_session():
 
 # ── Minimal app: only the routers the money-critical tests need ──
 def _build_test_app():
-    from app.routes import payments, tuckshop, merchants, webhook, auth as auth_routes, students
+    from app.routes import payments, tuckshop, merchants, webhook, auth as auth_routes, students, topup
 
     app = FastAPI()
     app.include_router(payments.router, prefix="/payments", tags=["Payments"])
@@ -97,6 +97,7 @@ def _build_test_app():
     app.include_router(webhook.router, prefix="/webhook", tags=["Webhook"])
     app.include_router(auth_routes.router, prefix="/auth", tags=["Authentication"])
     app.include_router(students.router, prefix="/students", tags=["Students"])
+    app.include_router(topup.router, prefix="/topup", tags=["Top-Up"])
     return app
 
 

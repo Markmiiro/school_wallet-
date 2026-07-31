@@ -232,20 +232,56 @@ async def check_topup_status(
             # Yo Uganda uses SUCCEEDED (not "completed")
             latest_status = yo_status.get("TransactionStatus", "INDETERMINATE")
 
-            if latest_status == "SUCCEEDED" and txn.status != "completed":
-                wallet = db.query(Wallet).filter(
-                    Wallet.id == txn.wallet_id
-                ).first()
-                if wallet:
-                    wallet.balance += txn.amount
-                txn.status = "completed"
-                db.commit()
-                print(f"✅ Top-up confirmed via polling: {reference_id}")
+            # `txn` was loaded before the await above, so it's stale the
+            # moment we come back — a concurrent request could have
+            # committed its own credit for this same reference while we
+            # were awaiting Yo's response. Re-fetch WITH a row lock now,
+            # after the await, and check status against this fresh read
+            # instead of the pre-await copy: a genuine concurrent poll
+            # blocks on this lock until the first one commits, then sees
+            # status == "completed" and skips crediting again. Mirrors
+            # the pattern applied to webhook.py's yo_uganda_ipn().
+            #
+            # populate_existing() matters here specifically because `txn`
+            # is already in this session's identity map from the load at
+            # the top of this function — without it, SQLAlchemy hands
+            # back that same (stale) Python object instead of refreshing
+            # its attributes from this query's result, and the lock ends
+            # up protecting nothing: the SELECT ... FOR UPDATE correctly
+            # blocks at the database level, but the in-memory .status
+            # this code then checks is still the pre-await copy.
+            if latest_status == "SUCCEEDED":
+                txn = (
+                    db.query(Transaction)
+                    .filter(Transaction.reference == reference_id)
+                    .populate_existing()
+                    .with_for_update()
+                    .first()
+                )
+
+                if txn.status != "completed":
+                    wallet = db.query(Wallet).filter(
+                        Wallet.id == txn.wallet_id
+                    ).first()
+                    if wallet:
+                        wallet.balance += txn.amount
+                    txn.status = "completed"
+                    db.commit()
+                    print(f"✅ Top-up confirmed via polling: {reference_id}")
 
             # Yo Uganda uses FAILED (uppercase)
-            elif latest_status == "FAILED" and txn.status != "failed":
-                txn.status = "failed"
-                db.commit()
+            elif latest_status == "FAILED":
+                txn = (
+                    db.query(Transaction)
+                    .filter(Transaction.reference == reference_id)
+                    .populate_existing()
+                    .with_for_update()
+                    .first()
+                )
+
+                if txn.status != "failed":
+                    txn.status = "failed"
+                    db.commit()
 
         except Exception as e:
             print(f"⚠️  Could not poll Yo Uganda: {e}")
