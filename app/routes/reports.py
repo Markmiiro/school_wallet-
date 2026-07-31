@@ -12,18 +12,122 @@
 # ================================================
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime, date, timedelta
 from typing import Optional
 
 from app.database import get_db
-from app.models import Transaction, Wallet, Student, Merchant, School, User
+from app.models import Transaction, Wallet, Student, Merchant, School, User, Payout
 from app.momo import disburse_to_merchant
-from app.auth import get_current_admin
+from app.auth import get_current_admin, assert_school_access
 from app.models import User
 
 router = APIRouter()
+
+
+# ================================================
+# Idempotent per-merchant payout — the shared core behind both
+# trigger_manual_payout() and automated_daily_payout(). See the Payout
+# model's docstring in app/models.py for why the reservation row is
+# inserted and committed BEFORE disburse_to_merchant() is ever called.
+# ================================================
+async def _process_merchant_payout(db: Session, merchant: Merchant, target_date: date) -> dict:
+    """
+    Pay out one merchant's completed sales for target_date, exactly
+    once no matter how many times this is called for the same
+    (merchant, target_date) — including genuinely concurrent calls.
+
+    Returns a dict with an "outcome" key: "sent" | "skipped" | "failed"
+    | "no_sales" | "no_phone".
+    """
+    if not merchant.momo_phone:
+        return {"merchant": merchant.name, "outcome": "no_phone", "reason": "No MoMo phone number set"}
+
+    txns = (
+        db.query(Transaction)
+        .filter(
+            Transaction.merchant_id == merchant.id,
+            Transaction.type == "payment",
+            Transaction.status == "completed",
+        )
+        .all()
+    )
+    day_txns = [t for t in txns if t.timestamp and t.timestamp.date() == target_date]
+    merchant_total = sum(t.amount for t in day_txns)
+
+    if merchant_total == 0:
+        return {"merchant": merchant.name, "outcome": "no_sales", "reason": "No sales — nothing to pay out"}
+
+    # Lock any existing row for this (merchant, date) FIRST — a
+    # concurrent retry of a "failed" row needs this to serialize
+    # correctly, the same reasoning as topup.py's check_topup_status().
+    existing = (
+        db.query(Payout)
+        .filter(Payout.merchant_id == merchant.id, Payout.payout_date == target_date)
+        .with_for_update()
+        .first()
+    )
+
+    if existing and existing.status in ("pending", "sent"):
+        return {
+            "merchant": merchant.name, "outcome": "skipped",
+            "reason": f"Already {existing.status} for {target_date}",
+            "amount_ugx": existing.amount,
+        }
+
+    if existing is None:
+        payout = Payout(
+            merchant_id=merchant.id, payout_date=target_date,
+            amount=merchant_total, status="pending",
+        )
+        db.add(payout)
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent request reserved this (merchant, date) first —
+            # belt-and-suspenders behind the row lock above, same shape
+            # as payments.py's nfc_payment() IntegrityError handling.
+            db.rollback()
+            return {
+                "merchant": merchant.name, "outcome": "skipped",
+                "reason": "A concurrent payout attempt claimed this merchant/date first",
+            }
+        db.refresh(payout)
+    else:
+        # existing.status == "failed" — retry, reusing the same row.
+        payout = existing
+        payout.status = "pending"
+        payout.amount = merchant_total
+        db.commit()
+
+    try:
+        result = await disburse_to_merchant(
+            phone=merchant.momo_phone, amount=merchant_total, merchant_name=merchant.name,
+        )
+        if result.get("Status") == "OK":
+            payout.status = "sent"
+            payout.yo_reference = result.get("ExternalReference") or result.get("data", {}).get("reference")
+            payout.completed_at = datetime.utcnow()
+            db.commit()
+            return {
+                "merchant": merchant.name, "outcome": "sent",
+                "amount_ugx": merchant_total, "reference": payout.yo_reference,
+            }
+        else:
+            payout.status = "failed"
+            payout.completed_at = datetime.utcnow()
+            db.commit()
+            return {
+                "merchant": merchant.name, "outcome": "failed",
+                "reason": result.get("StatusMessage", "Payout failed"),
+            }
+    except Exception as e:
+        payout.status = "failed"
+        payout.completed_at = datetime.utcnow()
+        db.commit()
+        return {"merchant": merchant.name, "outcome": "failed", "reason": str(e)}
 
 
 # ================================================
@@ -383,18 +487,19 @@ async def trigger_manual_payout(
     school_id: int,
     report_date: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_admin)
-
-
+    current_admin: User = Depends(get_current_admin),
 ):
     """
     Trigger end-of-day payout to all merchants.
-    Sends each vendor's daily sales to their MoMo number.
+    Sends each vendor's daily sales to their MoMo number, exactly once
+    per merchant per day — see _process_merchant_payout().
     Can also be triggered automatically at 6PM.
     """
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    assert_school_access(current_admin, school_id)
 
     # Parse date
     if report_date:
@@ -410,68 +515,34 @@ async def trigger_manual_payout(
         Merchant.is_active == True,
     ).all()
 
-    payouts_sent   = []
-    payouts_failed = []
+    payouts_sent    = []
+    payouts_skipped = []
+    payouts_failed  = []
 
     for merchant in merchants:
-        # Skip merchants with no payout phone
-        if not merchant.momo_phone:
-            payouts_failed.append({
-                "merchant": merchant.name,
-                "reason":   "No MoMo phone number set"
-            })
-            continue
+        outcome = await _process_merchant_payout(db, merchant, target_date)
 
-        # Get daily total
-        txns = (
-            db.query(Transaction)
-            .filter(
-                Transaction.merchant_id == merchant.id,
-                Transaction.type == "payment",
-                Transaction.status == "completed",
-            )
-            .all()
-        )
-
-        day_txns = [
-            t for t in txns
-            if t.timestamp and t.timestamp.date() == target_date
-        ]
-
-        merchant_total = sum(t.amount for t in day_txns)
-
-        # Skip if no sales
-        if merchant_total == 0:
-            payouts_failed.append({
-                "merchant": merchant.name,
-                "reason":   "No sales today — nothing to pay out"
-            })
-            continue
-
-        # Send payout via DGateway
-        try:
-            result = await disburse_to_merchant(
-                phone=merchant.momo_phone,
-                amount=merchant_total,
-                merchant_name=merchant.name,
-            )
-
+        if outcome["outcome"] == "sent":
             payouts_sent.append({
-                "merchant":    merchant.name,
-                "phone":       merchant.momo_phone,
-                "amount_ugx":  merchant_total,
-                "status":      "sent",
-                "reference":   result.get("data", {}).get("reference", "N/A"),
+                "merchant":   outcome["merchant"],
+                "phone":      merchant.momo_phone,
+                "amount_ugx": outcome["amount_ugx"],
+                "status":     "sent",
+                "reference":  outcome.get("reference", "N/A"),
             })
-
-            print(f"✅ Payout sent: {merchant.name} UGX {merchant_total:,}")
-
-        except Exception as e:
+            print(f"✅ Payout sent: {merchant.name} UGX {outcome['amount_ugx']:,}")
+        elif outcome["outcome"] == "skipped":
+            payouts_skipped.append({
+                "merchant": outcome["merchant"],
+                "reason":   outcome["reason"],
+            })
+        else:
             payouts_failed.append({
-                "merchant": merchant.name,
-                "reason":   str(e),
+                "merchant": outcome["merchant"],
+                "reason":   outcome["reason"],
             })
-            print(f"❌ Payout failed: {merchant.name} — {e}")
+            if outcome["outcome"] == "failed":
+                print(f"❌ Payout failed: {merchant.name} — {outcome['reason']}")
 
     total_paid = sum(p["amount_ugx"] for p in payouts_sent)
 
@@ -480,10 +551,12 @@ async def trigger_manual_payout(
         "payout_date":   str(target_date),
         "total_paid_ugx": total_paid,
         "payouts_sent":  len(payouts_sent),
+        "payouts_skipped": len(payouts_skipped),
         "payouts_failed": len(payouts_failed),
         "details": {
-            "sent":   payouts_sent,
-            "failed": payouts_failed,
+            "sent":    payouts_sent,
+            "skipped": payouts_skipped,
+            "failed":  payouts_failed,
         }
     }
 
@@ -534,46 +607,25 @@ async def automated_daily_payout(
         school_payouts = []
 
         for merchant in merchants:
-            if not merchant.momo_phone:
+            outcome = await _process_merchant_payout(db, merchant, today)
+
+            # Matches the original behavior: a merchant with no phone or
+            # no sales isn't reported at all, just silently skipped.
+            if outcome["outcome"] in ("no_phone", "no_sales"):
                 continue
 
-            txns = (
-                db.query(Transaction)
-                .filter(
-                    Transaction.merchant_id == merchant.id,
-                    Transaction.type == "payment",
-                    Transaction.status == "completed",
-                )
-                .all()
-            )
-
-            day_txns = [
-                t for t in txns
-                if t.timestamp and t.timestamp.date() == today
-            ]
-
-            merchant_total = sum(t.amount for t in day_txns)
-
-            if merchant_total == 0:
-                continue
-
-            try:
-                result = await disburse_to_merchant(
-                    phone=merchant.momo_phone,
-                    amount=merchant_total,
-                    merchant_name=merchant.name,
-                )
-                school_total += merchant_total
+            if outcome["outcome"] == "sent":
+                school_total += outcome["amount_ugx"]
                 school_payouts.append({
-                    "merchant":   merchant.name,
-                    "amount_ugx": merchant_total,
+                    "merchant":   outcome["merchant"],
+                    "amount_ugx": outcome["amount_ugx"],
                     "status":     "sent",
                 })
-            except Exception as e:
+            else:
                 school_payouts.append({
-                    "merchant":   merchant.name,
-                    "amount_ugx": merchant_total,
-                    "status":     f"failed: {e}",
+                    "merchant":   outcome["merchant"],
+                    "amount_ugx": outcome.get("amount_ugx", 0),
+                    "status":     outcome["outcome"],  # "skipped" or "failed"
                 })
 
         results.append({

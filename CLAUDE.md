@@ -126,6 +126,12 @@ under duplicate/rapid callbacks. Use a dedicated test database.
   `create_all()` never retroactively alters an existing table, so the live table
   predates that field. Needs reconciliation (add the column live) — not done yet,
   flagged only.
+- `app/routes/reports.py`'s `automated_daily_payout` falls back to a hardcoded
+  default (`"school_wallet_settle_2026"`) for `SETTLEMENT_SECRET` if that env var
+  isn't set on Railway — found 2026-07-31 while fixing the payout double-charge
+  race. That default is now in git history, so it should be treated as public.
+  Confirm `SETTLEMENT_SECRET` is actually set in Railway → Variables; if it's ever
+  relying on the fallback, rotate it. Flagged only, not changed.
 
 ---
 

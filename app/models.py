@@ -1,6 +1,6 @@
 from sqlalchemy import (
-    Column, Integer, String,
-    ForeignKey, DateTime, Boolean
+    Column, Integer, String, Date,
+    ForeignKey, DateTime, Boolean, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -254,3 +254,36 @@ class Payment(Base):
 
     # Relationships
     wallet = relationship("Wallet", back_populates="payments")
+
+
+# ════════════════════════════════════════════════
+# PAYOUTS
+# End-of-day merchant settlement — one row per (merchant, calendar
+# date) being paid out, enforced by the unique constraint below. This
+# row is the idempotency mechanism for app/routes/reports.py's payout
+# endpoints: it's inserted and committed BEFORE disburse_to_merchant()
+# is ever called, so a second concurrent trigger for the same
+# merchant/date either loses the INSERT race at this constraint (never
+# calls Yo) or sees an already-"pending"/"sent" row and skips. Only a
+# "failed" row is retried — reused in place, never a second row, since
+# the unique constraint permits exactly one row per (merchant, date)
+# regardless of how many attempts it takes.
+# ════════════════════════════════════════════════
+class Payout(Base):
+    __tablename__ = "payouts"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    merchant_id  = Column(Integer, ForeignKey("merchants.id"), nullable=False)
+    payout_date  = Column(Date, nullable=False)
+    amount       = Column(Integer, nullable=False)   # UGX
+    status       = Column(String, nullable=False, default="pending")  # pending | sent | failed
+    yo_reference = Column(String, nullable=True)      # ExternalReference from disburse_to_merchant
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("merchant_id", "payout_date", name="uq_payouts_merchant_date"),
+    )
+
+    # Relationships
+    merchant = relationship("Merchant")
