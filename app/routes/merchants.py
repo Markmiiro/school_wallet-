@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Merchant, School
+from app.models import Merchant, School, User
+from app.auth import get_current_admin, assert_school_access
 
 router = APIRouter()
 
@@ -10,18 +11,23 @@ router = APIRouter()
 # ================================================
 # POST /merchants/
 # Create a new merchant (tuck shop / canteen)
+# Admin-only, school-scoped — a scoped admin may only create a
+# merchant for their own school; a super admin may create for any.
 # ================================================
 @router.post("/")
 def create_merchant(
     name: str,
     school_id: int,
     momo_phone: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
 ):
     """
     Register a tuck shop or canteen as a merchant.
     momo_phone is where their daily sales are paid out.
     """
+    assert_school_access(current_admin, school_id)
+
     # Check school exists
     school = db.query(School).filter(School.id == school_id).first()
     if not school:

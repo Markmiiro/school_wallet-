@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import School, User
-from app.auth import get_current_admin
+from app.auth import get_current_admin, assert_school_access, is_super_admin
 
 router = APIRouter()
 
@@ -68,15 +68,24 @@ def school_payload(school: School) -> dict:
 
 # ================================================
 # POST /schools/
-# Create a new school
+# Create a new school. Super-admin only — a brand new school doesn't
+# belong to any admin yet, so there's no resource for
+# assert_school_access to scope against.
 # ================================================
 @router.post("/")
 def create_school(
     name: str,
     location: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
 ):
     """Register a new school in the system."""
+
+    if not is_super_admin(current_admin):
+        raise HTTPException(
+            status_code=403,
+            detail="Only a super admin can create new schools",
+        )
 
     # Check school name not already taken
     existing = db.query(School).filter(School.name == name).first()
@@ -126,19 +135,24 @@ def get_school(school_id: int, db: Session = Depends(get_db)):
 
 # ================================================
 # PUT /schools/{school_id}
-# Update a school's name or location
+# Update a school's name or location. Admin-only, school-scoped — a
+# scoped admin may only update their own school; a super admin may
+# update any.
 # ================================================
 @router.put("/{school_id}")
 def update_school(
     school_id: int,
     name: str = None,
     location: str = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
 ):
     """Update a school's name or location."""
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    assert_school_access(current_admin, school_id)
 
     if name:
         school.name = name
@@ -172,11 +186,13 @@ async def upload_school_badge(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
-    """Upload a school badge image. Admins only."""
+    """Upload a school badge image. Admins only, scoped to their own school."""
 
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    assert_school_access(current_user, school_id)
 
     if not _cloudinary_ready():
         raise HTTPException(
@@ -262,11 +278,13 @@ def set_school_badge_url(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin),
 ):
-    """Set or clear a school's badge URL directly. Admins only."""
+    """Set or clear a school's badge URL directly. Admins only, scoped to their own school."""
 
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    assert_school_access(current_user, school_id)
 
     if badge_url:
         cleaned = badge_url.strip()

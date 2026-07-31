@@ -88,7 +88,10 @@ def db_session():
 
 # ── Minimal app: only the routers the money-critical tests need ──
 def _build_test_app():
-    from app.routes import payments, tuckshop, merchants, webhook, auth as auth_routes, students, topup
+    from app.routes import (
+        payments, tuckshop, merchants, webhook, auth as auth_routes,
+        students, topup, schools, users,
+    )
 
     app = FastAPI()
     app.include_router(payments.router, prefix="/payments", tags=["Payments"])
@@ -98,6 +101,8 @@ def _build_test_app():
     app.include_router(auth_routes.router, prefix="/auth", tags=["Authentication"])
     app.include_router(students.router, prefix="/students", tags=["Students"])
     app.include_router(topup.router, prefix="/topup", tags=["Top-Up"])
+    app.include_router(schools.router, prefix="/schools", tags=["Schools"])
+    app.include_router(users.router, prefix="/users", tags=["Users"])
     return app
 
 
@@ -239,6 +244,32 @@ def admin_user(db_session, school):
 @pytest.fixture()
 def admin_headers(admin_user):
     return headers_for(admin_user)
+
+
+@pytest.fixture()
+def second_school(db_session):
+    s = models.School(name="Other Test School", location="Jinja")
+    db_session.add(s)
+    db_session.commit()
+    db_session.refresh(s)
+    return s
+
+
+@pytest.fixture()
+def super_admin_user(db_session):
+    u = models.User(
+        name="Test Super Admin", phone="256700999002", role="admin",
+        pin_hash=hash_pin("1234"), school_id=None,
+    )
+    db_session.add(u)
+    db_session.commit()
+    db_session.refresh(u)
+    return u
+
+
+@pytest.fixture()
+def super_admin_headers(super_admin_user):
+    return headers_for(super_admin_user)
 
 
 # ── Yo webhook signature verification ──────────────────
