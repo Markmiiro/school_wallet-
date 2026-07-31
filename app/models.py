@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, String, Float,
+    Column, Integer, String,
     ForeignKey, DateTime, Boolean
 )
 from sqlalchemy.orm import relationship
@@ -108,13 +108,18 @@ class Student(Base):
 # ════════════════════════════════════════════════
 # WALLETS
 # One wallet per student.
-# Balance is in UGX (stored as Float).
+# Balance is in UGX (stored as Integer — UGX has no subunit, and
+# storing money as Float risks binary floating-point drift after many
+# +=/-= operations). Was Float; the live column needs a one-time
+# manual ALTER TABLE to match (not an automatic startup self-heal —
+# a column type change is a heavier, table-rewriting operation than
+# the ADD COLUMN/ADD CONSTRAINT helpers in app/database.py).
 # ════════════════════════════════════════════════
 class Wallet(Base):
     __tablename__ = "wallets"
 
     id          = Column(Integer, primary_key=True, index=True)
-    balance     = Column(Float, default=0.0)
+    balance     = Column(Integer, default=0)
     is_active   = Column(Boolean, default=True)
     daily_limit = Column(Integer, default=20000)   # UGX per day
     student_id  = Column(Integer, ForeignKey("students.id"), nullable=False)
@@ -137,7 +142,7 @@ class Transaction(Base):
     id          = Column(Integer, primary_key=True, index=True)
     wallet_id   = Column(Integer, ForeignKey("wallets.id"), nullable=False)
     merchant_id = Column(Integer, ForeignKey("merchants.id"), nullable=True)
-    amount      = Column(Float, nullable=False)
+    amount      = Column(Integer, nullable=False)          # UGX — see Wallet.balance's comment on why Integer, not Float
     type        = Column(String, nullable=False)          # topup | payment
     status      = Column(String, default="pending")       # pending | completed | failed
     reference   = Column(String, nullable=True, unique=True)  # Yo Uganda ExternalReference
@@ -242,7 +247,7 @@ class Payment(Base):
 
     id        = Column(Integer, primary_key=True, index=True)
     wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False)
-    amount    = Column(Float, nullable=False)
+    amount    = Column(Integer, nullable=False)     # UGX — see Wallet.balance's comment on why Integer, not Float
     status    = Column(String, nullable=False)     # completed | failed
     reference = Column(String, nullable=True, unique=True)  # idempotency key
     timestamp = Column(DateTime, default=datetime.utcnow)
