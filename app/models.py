@@ -140,7 +140,7 @@ class Transaction(Base):
     amount      = Column(Float, nullable=False)
     type        = Column(String, nullable=False)          # topup | payment
     status      = Column(String, default="pending")       # pending | completed | failed
-    reference   = Column(String, nullable=True)           # Yo Uganda ExternalReference
+    reference   = Column(String, nullable=True, unique=True)  # Yo Uganda ExternalReference
     momo_phone  = Column(String, nullable=True)           # phone used for top-up
     description = Column(String, nullable=True)           # e.g. "Lunch money"
     timestamp   = Column(DateTime, default=datetime.utcnow)

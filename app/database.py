@@ -103,6 +103,14 @@ def create_tables():
 
     print("All columns verified")
 
+    # Closes the webhook double-credit race (app/routes/webhook.py):
+    # a repeated Yo IPN must not be able to insert a second Transaction
+    # with the same reference. Production was audited for pre-existing
+    # duplicate references before this was added (none found) — see
+    # add_unique_constraint_if_missing()'s docstring for why a failure
+    # here is logged loudly rather than swallowed.
+    add_unique_constraint_if_missing("transactions", "reference", "uq_transactions_reference")
+
 
 def add_column_if_missing(table: str, column: str, col_type: str):
     """
@@ -146,3 +154,38 @@ def add_column_if_missing(table: str, column: str, col_type: str):
         # Log loudly rather than silently swallowing — a genuinely
         # failed migration should be visible in the deploy logs.
         print(f"   WARNING: could not add {table}.{column}: {e}")
+
+
+def add_unique_constraint_if_missing(table: str, column: str, constraint_name: str):
+    """
+    Adds a single-column UNIQUE constraint only if it does not already
+    exist. Same reasoning as add_column_if_missing(): check first, own
+    transaction so a failure can't cascade, log loudly instead of
+    swallowing — if this ever fails on a live deploy (e.g. a duplicate
+    slipped in between the audit and the deploy), that must be visible,
+    not silent, since it means the double-credit race this constraint
+    exists to close is still open.
+
+    Postgres treats NULLs as distinct under UNIQUE, so this is safe to
+    add on a nullable column — multiple NULL references can still coexist.
+    """
+    try:
+        inspector = inspect(engine)
+
+        if table not in inspector.get_table_names():
+            return
+
+        existing = {
+            tuple(uc["column_names"]) for uc in inspector.get_unique_constraints(table)
+        }
+        if (column,) in existing:
+            return  # Already there — nothing to do.
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"ALTER TABLE {table} ADD CONSTRAINT {constraint_name} UNIQUE ({column})")
+            )
+        print(f"   Added unique constraint: {table}.{column} ({constraint_name})")
+
+    except Exception as e:
+        print(f"   WARNING: could not add unique constraint {constraint_name} on {table}.{column}: {e}")
