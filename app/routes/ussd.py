@@ -291,8 +291,7 @@ async def yo_ussd_callout(
             "validated": True,
             "message": (
                 f"Confirm payment of UGX {REGISTRATION_FEE:,} to "
-                f"Register {student_name} for a {color_label} NFC card\n"
-                f"1. Confirm\n00. Cancel"
+                f"Register {student_name} for a {color_label} NFC card"
             ),
             "ussd_processor_params": {
                 "amount": str(REGISTRATION_FEE),
@@ -328,8 +327,7 @@ async def yo_ussd_callout(
         return {
             "validated": True,
             "message": (
-                f"Confirm a top up of UGX {amount:,} for {student.name}\n"
-                f"1. Confirm\n00. Cancel"
+                f"Confirm a top up of UGX {amount:,} for {student.name}"
             ),
             "ussd_processor_params": {
                 "payment_external_reference": reference,
