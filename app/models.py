@@ -276,8 +276,20 @@ class Payout(Base):
     merchant_id  = Column(Integer, ForeignKey("merchants.id"), nullable=False)
     payout_date  = Column(Date, nullable=False)
     amount       = Column(Integer, nullable=False)   # UGX
-    status       = Column(String, nullable=False, default="pending")  # pending | sent | failed
-    yo_reference = Column(String, nullable=True)      # ExternalReference from disburse_to_merchant
+    # pending | sent | failed | indeterminate
+    #   pending       → reserved; a send is in flight
+    #   sent          → Yo returned SUCCEEDED
+    #   failed        → money definitively did not move; a retry is allowed
+    #   indeterminate → fate unknown; NEVER re-send, resolve by polling Yo
+    # This is a String column, so "indeterminate" needs no live migration —
+    # deliberate, given the payments.timestamp drift already on record in
+    # CLAUDE.md. See _classify_payout_result() in app/routes/reports.py.
+    status       = Column(String, nullable=False, default="pending")
+    # The ExternalReference of the LAST attempt, written BEFORE the send so
+    # a process that dies mid-call still leaves the reference the resolver
+    # needs. Deterministic: SW-PAYOUT-{merchant_id}-{YYYYMMDD}-{attempt};
+    # the trailing attempt number is what _next_attempt() reads back.
+    yo_reference = Column(String, nullable=True)
     created_at   = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 

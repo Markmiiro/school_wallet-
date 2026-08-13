@@ -108,6 +108,30 @@ _SIGNATURE_FIELD_MAX = 255
 
 
 # ================================================
+# DELIVERY MARKERS (not from Yo — added by us)
+#
+# Every function below returns a "_Delivery" key saying how far the
+# request actually got. Callers MUST branch on this before reading
+# anything else, because "Yo rejected my request" and "I never learned
+# what Yo did" have opposite safe responses, and the XML alone cannot
+# tell them apart:
+#
+#   "not_sent"  → the request never left this process (e.g. signing
+#                 failed). Money definitively did not move. Retryable.
+#   "unknown"   → the request was sent; no usable answer came back
+#                 (timeout, connection reset, unparseable body). The
+#                 money MAY have moved. NEVER retryable without polling.
+#   "responded" → Yo answered and we parsed it. Read TransactionStatus.
+#
+# The leading underscore keeps these from colliding with an XML tag name
+# in parse_yo_response()'s flattened output.
+# ================================================
+_DELIVERY_NOT_SENT  = "not_sent"
+_DELIVERY_UNKNOWN   = "unknown"
+_DELIVERY_RESPONDED = "responded"
+
+
+# ================================================
 # HELPER: Parse Yo Uganda XML response
 # ================================================
 def parse_yo_response(xml_text: str) -> dict:
@@ -314,21 +338,41 @@ async def verify_transaction(tx_ref: str) -> dict:
     Uses Yo Uganda actransactioncheckstatus.
     Poll roughly every 15 seconds for transactions still PENDING.
 
+    WORKS FOR WITHDRAWALS TOO — confirmed with Yo. acwithdrawfunds fires
+    NO callbacks of any kind, so this call is the ONLY way to learn a
+    payout's fate. Resolving an unknown payout is therefore active
+    polling by us; nothing will arrive on its own. See _resolve_payout()
+    in app/routes/reports.py for the caller.
+
     TransactionStatus values:
       PENDING       → waiting for the payer to approve
       SUCCEEDED     → payment confirmed
       FAILED        → rejected or timed out
       INDETERMINATE → unknown; resolves within ~1 hour, check again
+
+    Those four are exhaustive (confirmed with Yo). Anything else in that
+    field is a protocol change, and callers must treat it as unresolved
+    rather than guessing.
     """
 
     # ── TEST MODE ──────────────────────────────
+    # Defaults to PENDING, i.e. UNRESOLVED. Failing safe in test mode has
+    # to mean "we don't know yet", never "the money landed" — a default of
+    # SUCCEEDED would let a resolver sweep mark every unknown payout as
+    # paid on a dev box. Override per-test with TEST_YO_TX_STATUS; read at
+    # call time so a test can set it after import.
     if _is_test_mode():
-        print(f"⚠️  TEST MODE — Yo Uganda fake status check for {tx_ref}")
+        fake_status = os.getenv("TEST_YO_TX_STATUS", "PENDING").strip().upper()
+        print(
+            f"⚠️  TEST MODE — Yo Uganda fake status check for {tx_ref} "
+            f"→ {fake_status}"
+        )
         return {
             "Status":               "OK",
-            "TransactionStatus":    "SUCCEEDED",
+            "TransactionStatus":    fake_status,
             "TransactionReference": tx_ref,
             "StatusMessage":        "TEST MODE — not a real status",
+            "_Delivery":            _DELIVERY_RESPONDED,
         }
 
     xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -349,10 +393,18 @@ async def verify_transaction(tx_ref: str) -> dict:
                 headers={"Content-Type": "application/xml"},
                 timeout=30.0,
             )
-        return parse_yo_response(response.text)
+        result = parse_yo_response(response.text)
+        result["_Delivery"] = _DELIVERY_RESPONDED
+        return result
     except Exception as e:
         print(f"Yo Uganda status check error: {e}")
-        return {"Status": "ERROR", "StatusMessage": str(e)}
+        # A failed status CHECK resolves nothing. It must never be read as
+        # "the transaction failed" — that inversion is how you double-pay.
+        return {
+            "Status":        "ERROR",
+            "StatusMessage": str(e),
+            "_Delivery":     _DELIVERY_UNKNOWN,
+        }
 
 
 # ================================================
@@ -361,7 +413,9 @@ async def verify_transaction(tx_ref: str) -> dict:
 async def disburse_to_merchant(
     phone: str,
     amount: int,
-    merchant_name: str = "Merchant"
+    merchant_name: str = "Merchant",
+    external_reference: str | None = None,
+    narrative: str | None = None,
 ) -> dict:
     """
     Send end-of-day sales money to a merchant's mobile money wallet (§4).
@@ -371,6 +425,23 @@ async def disburse_to_merchant(
 
     Signed with your private key per §4.1 — Yo will reject unsigned
     requests once public key authentication is enabled on your account.
+
+    SYNCHRONOUS in most cases (confirmed with Yo); the exception is a rare
+    interruption at the mobile-money provider, which surfaces as PENDING
+    or INDETERMINATE. There are NO callbacks for withdrawals — the caller
+    resolves those by polling verify_transaction().
+
+    DUPLICATE REJECTION (confirmed with Yo): Yo rejects a withdrawal whose
+    (Account, Amount, Narrative, ExternalReference) ALL FOUR match an
+    earlier one. That is a safety net worth having, so the caller should
+    pass a DETERMINISTIC external_reference and narrative — then an
+    accidental re-send of the same attempt is refused by Yo instead of
+    paying the merchant twice. Omitting them falls back to a random uuid4
+    reference, which Yo cannot dedupe at all.
+
+    PublicKeyAuthenticationNonce stays random per call and is NOT part of
+    the dedupe tuple, so §4.1's per-call uniqueness rule and determinism
+    of the tuple do not conflict.
 
     IMPORTANT (§4.1 guidance): debit the merchant's balance on YOUR side
     first, then call this. If Yo reports failure, reverse that debit.
@@ -382,14 +453,20 @@ async def disburse_to_merchant(
         phone         → merchant's MoMo e.g. "256700000001"
         amount        → daily sales total in UGX
         merchant_name → used in the payment narrative
+        external_reference → deterministic per payout attempt; echoed back,
+                        and used as PrivateTransactionReference when polling
+        narrative     → must contain nothing volatile (no timestamps, no
+                        uuid), or the dedupe tuple stops matching across
+                        retries
 
     Returns:
-        dict with Status, TransactionStatus, and (on success) the
-        ExternalReference we generated, so the caller can reconcile.
+        dict with Status, TransactionStatus, _Delivery, and the
+        ExternalReference used, so the caller can reconcile.
     """
 
     # ── TEST MODE ──────────────────────────────
     if _is_test_mode():
+        ext_ref = external_reference or str(uuid.uuid4())
         print(f"\n⚠️  TEST MODE — Yo Uganda fake payout (NO REAL MONEY SENT)")
         print(f"  Merchant: {merchant_name}")
         print(f"  Phone:    {phone}")
@@ -398,12 +475,14 @@ async def disburse_to_merchant(
             "Status":            "OK",
             "TransactionStatus": "SUCCEEDED",
             "StatusMessage":     "TEST MODE — no real payout",
+            "ExternalReference": ext_ref,
+            "_Delivery":         _DELIVERY_RESPONDED,
         }
 
     phone     = phone.strip().replace("+", "").replace(" ", "")
-    ext_ref   = str(uuid.uuid4())
+    ext_ref   = external_reference or str(uuid.uuid4())
     nonce     = _generate_nonce()
-    narrative = f"Daily payout to {merchant_name}"
+    narrative = narrative or f"Daily payout to {merchant_name}"
 
     # ── Sign the request (§4.1) ──────────────────
     try:
@@ -418,7 +497,14 @@ async def disburse_to_merchant(
         # Do NOT send an unsigned request — Yo would reject it anyway,
         # and a clear error here is easier to diagnose than a -x code.
         print(f"Yo Uganda payout signing error: {e}")
-        return {"Status": "ERROR", "StatusMessage": f"Signing failed: {e}"}
+        # Nothing left this process, so the money definitively did not
+        # move and a retry is safe. Marked so the caller can tell this
+        # apart from a timeout, which is the opposite situation.
+        return {
+            "Status":        "ERROR",
+            "StatusMessage": f"Signing failed: {e}",
+            "_Delivery":     _DELIVERY_NOT_SENT,
+        }
 
     xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
 <AutoCreate>
@@ -445,6 +531,7 @@ async def disburse_to_merchant(
             )
         result = parse_yo_response(response.text)
         result.setdefault("ExternalReference", ext_ref)
+        result["_Delivery"] = _DELIVERY_RESPONDED
 
         print(
             f"Yo Uganda payout: {result.get('Status')} "
@@ -454,8 +541,12 @@ async def disburse_to_merchant(
         return result
     except Exception as e:
         print(f"Yo Uganda payout error: {e}")
+        # THE TIMEOUT CASE. The request WAS sent; Yo may well have paid the
+        # merchant and simply not answered us in time. This is NOT a
+        # failure — see _classify_payout_result() in app/routes/reports.py.
         return {
             "Status":            "ERROR",
             "StatusMessage":     str(e),
             "ExternalReference": ext_ref,
+            "_Delivery":         _DELIVERY_UNKNOWN,
         }
