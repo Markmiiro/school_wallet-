@@ -132,8 +132,40 @@ under duplicate/rapid callbacks. Use a dedicated test database.
   race. That default is now in git history, so it should be treated as public.
   Confirm `SETTLEMENT_SECRET` is actually set in Railway → Variables; if it's ever
   relying on the fallback, rotate it. Flagged only, not changed.
+- **Mixed date basis: UTC timestamps compared against local-clock dates.** Found
+  2026-08-22. Every `Transaction.timestamp` / `Payment.timestamp` is written with
+  `datetime.utcnow()` (UTC), but the dates they are compared against come from
+  `date.today()`, which is the *app container's local* date. There is no timezone
+  handling anywhere in `app/` — no `ZoneInfo`, no `pytz`, no `astimezone`. Two
+  places matter:
+    * `app/routes/reports.py:375` — `_process_merchant_payout` selects a day's
+      sales with `t.timestamp.date() == target_date`, where `target_date` came
+      from `date.today()`. A payout run while the local date is ahead of the UTC
+      date would sum the wrong day and write a `Payout` row dated in the future.
+    * `app/routes/payments.py:83` (and the same block in `nfc_payment` and
+      `sync_offline_payments`) — the `daily_limit` window is `date.today()`
+      compared against UTC timestamps, so the spending day would not line up with
+      the school day.
+  **Both are correct ONLY while the container runs `TZ=UTC`.** That is Railway's
+  default and is now set explicitly in Railway → Variables (confirmed 2026-08-22),
+  so this is latent, not live. It becomes a live bug the moment anyone sets `TZ`
+  to `Africa/Kampala` (UTC+3) or deploys anywhere with a non-UTC clock — the
+  payout case would silently miss a full day of a merchant's sales. Flagged only,
+  not changed; fixing it properly means picking one basis and converting at the
+  boundary, which touches money code.
+  Confirm `SETTLEMENT_SECRET` is actually set in Railway → Variables; if it's ever
+  relying on the fallback, rotate it. Flagged only, not changed.
 
 ---
+
+- **`_is_test_mode()`'s APP_ENV fallback is a migration shim.** Added 2026-08-24
+  alongside `YO_LIVE`. With `YO_LIVE` unset, `_is_test_mode()` still falls back to
+  `APP_ENV != "production"` — which partly re-couples the two axes (network on/off
+  vs which Yo certs to trust) that `YO_LIVE` exists to separate. It is temporary.
+  Remove it once (1) `YO_LIVE` is set explicitly in every environment including
+  `tests/conftest.py`, and (2) the three test files that patch `momo.APP_ENV` to
+  leave test mode are rewritten to patch `YO_LIVE`. `tests/test_yo_live_switch.py`
+  pins the whole truth table, fallback included, so removal is deliberate.
 
 ## How I want you to work
 

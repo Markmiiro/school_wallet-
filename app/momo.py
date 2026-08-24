@@ -80,10 +80,82 @@ load_dotenv()
 
 YO_USERNAME = os.getenv("YO_USERNAME", "")
 YO_PASSWORD = os.getenv("YO_PASSWORD", "")
-YO_API_URL  = os.getenv(
-    "YO_API_URL",
-    "https://sandbox.yo.co.ug/services/yopaymentsdev/"
-)
+
+APP_ENV = os.getenv("APP_ENV", "development")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env var. Unset/blank falls back to `default`."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# ── THE NETWORK SWITCH ─────────────────────────
+# Whether we actually talk to Yo over the network. Deliberately SEPARATE
+# from APP_ENV, which selects which environment's certs and keys to load
+# (webhook.py's IPN cert, ussd.py's USSD public key). Those are two
+# independent axes and conflating them is unrepresentable:
+#
+#   APP_ENV=development + YO_LIVE=true  → real calls to the Yo SANDBOX,
+#       while webhook/USSD keep verifying against sandbox certs. This is
+#       the combination we need and could not express before.
+#   APP_ENV=production  + YO_LIVE=true  → real calls to production Yo.
+#   YO_LIVE=false (any APP_ENV)         → no HTTP at all, fake responses.
+#
+# Defaults to (APP_ENV == "production") so an existing production deploy
+# does not silently go dark — going "dark" here means fake SUCCESS, which
+# is the exact failure this whole module is defending against.
+YO_LIVE = _env_flag("YO_LIVE", APP_ENV == "production")
+
+# Whether YO_LIVE was set explicitly, as opposed to inferred from APP_ENV.
+# When it was NOT set, _is_test_mode() falls back to reading APP_ENV live.
+#
+# ⚠️ MIGRATION SHIM — NOT THE INTENDED END STATE.
+# That fallback partly re-couples the two axes this whole change exists to
+# separate: with YO_LIVE unset, answering "will this open a socket?" still
+# requires knowing APP_ENV, which is exactly the ambiguity that hid the
+# original bug. It is here only so this commit removes no switch that
+# something currently depends on.
+#
+# REMOVE IT once BOTH are true:
+#   1. YO_LIVE is set explicitly in every environment — Railway, any local
+#      .env, and tests/conftest.py. Until then, dropping the fallback makes
+#      YO_LIVE effectively required, and any environment that misses it
+#      silently falls into test mode: the fake-success regression, back
+#      again.
+#   2. The three test files that steer test mode via APP_ENV are rewritten
+#      to patch YO_LIVE instead —
+#        tests/test_payout_timeout_indeterminate.py:114
+#        tests/test_payout_resolution_gaps.py:89
+#        tests/test_yo_api_conformance.py:101
+#
+# Then _is_test_mode() reduces to (not YO_USERNAME) or (not YO_LIVE).
+# tests/test_yo_live_switch.py pins the current behaviour, the fallback
+# included, so removing it is a deliberate act rather than an oversight.
+_YO_LIVE_EXPLICIT = bool(os.getenv("YO_LIVE", "").strip())
+
+# The SANDBOX endpoint, including /task.php — without that path segment the
+# host answers, but nothing is ever routed to the payments service.
+#
+# This is a sandbox-only default. Reaching it with YO_LIVE set means real
+# credentials go to sandbox; that is legitimate when APP_ENV=development
+# (sandbox account, sandbox certs) and a mistake in production, so the
+# guard below keys off APP_ENV, not YO_LIVE.
+_YO_SANDBOX_API_URL = "https://sandbox.yo.co.ug/services/yopaymentsdev/task.php"
+
+YO_API_URL = os.getenv("YO_API_URL", "")
+if not YO_API_URL:
+    if APP_ENV == "production":
+        raise RuntimeError(
+            "YO_API_URL is not set and APP_ENV=production. Refusing to fall "
+            "back to the Yo sandbox endpoint in production — real credentials "
+            "would be sent to sandbox and every payment would report success "
+            "while no money moved. Set YO_API_URL in Railway → Variables to "
+            "the production Yo Payments URL."
+        )
+    YO_API_URL = _YO_SANDBOX_API_URL
 
 # Success callbacks (IPN) — see webhook.py POST /webhook/yo
 YO_IPN_URL = os.getenv(
@@ -101,10 +173,24 @@ YO_FAILURE_URL = os.getenv(
 # Set this in Railway → Variables. Never commit the key itself.
 YO_PRIVATE_KEY = os.getenv("YO_PRIVATE_KEY", "")
 
-APP_ENV = os.getenv("APP_ENV", "development")
-
 # Per §4.1, these fields are truncated before signing.
 _SIGNATURE_FIELD_MAX = 255
+
+# ================================================
+# REQUEST HEADERS (§3.2.1)
+#
+# Yo requires BOTH of these on every request. "application/xml" and a
+# missing transfer-encoding are silently accepted by the transport and then
+# not parsed as a request — you get a non-answer, not an error. Adding both
+# is what produced our first successful sandbox call, so treat this dict as
+# part of the wire protocol and keep all three call sites on it.
+#
+# (app/sms.py talks to a different gateway and is not covered by this.)
+# ================================================
+_YO_HEADERS = {
+    "Content-Type": "text/xml",
+    "Content-transfer-encoding": "text",
+}
 
 
 # ================================================
@@ -157,15 +243,31 @@ def parse_yo_response(xml_text: str) -> dict:
         return result
     except Exception as e:
         print(f"XML parse error: {e}")
-        return {"Status": "ERROR", "StatusMessage": str(e)}
+        # NOT a Yo answer — shaped like one only by accident of this
+        # fallback. Callers that must distinguish "Yo rejected the request"
+        # from "we could not read the reply" key off _ParseFailed; without
+        # it the two are byte-identical and the caller can only guess.
+        # Additive: anything that ignores this key is unaffected.
+        return {"Status": "ERROR", "StatusMessage": str(e), "_ParseFailed": True}
 
 
 def _is_test_mode() -> bool:
     """
     True when we should fake responses instead of calling Yo Uganda.
     Kept as one function so the condition can't drift between callers.
+
+    YO_LIVE, when set explicitly, is the sole authority: APP_ENV selects
+    which Yo environment's certs/keys we trust, which is a different
+    question from whether we open a socket. When YO_LIVE is unset we fall
+    back to the old APP_ENV test, read at call time, so this change adds a
+    switch without removing one. See the YO_LIVE block above.
     """
-    return (not YO_USERNAME) or (APP_ENV != "production")
+    if not YO_USERNAME:
+        return True
+    if _YO_LIVE_EXPLICIT:
+        return not YO_LIVE
+    # YO_LIVE unset — legacy behaviour, read APP_ENV at call time.
+    return APP_ENV != "production"
 
 
 def _generate_nonce() -> str:
@@ -309,7 +411,7 @@ async def charge_mobile_money(
             response = await client.post(
                 YO_API_URL,
                 content=xml_request,
-                headers={"Content-Type": "application/xml"},
+                headers=_YO_HEADERS,
                 timeout=30.0,
             )
 
@@ -390,7 +492,7 @@ async def verify_transaction(tx_ref: str) -> dict:
             response = await client.post(
                 YO_API_URL,
                 content=xml_request,
-                headers={"Content-Type": "application/xml"},
+                headers=_YO_HEADERS,
                 timeout=30.0,
             )
         result = parse_yo_response(response.text)
@@ -471,9 +573,17 @@ async def disburse_to_merchant(
         print(f"  Merchant: {merchant_name}")
         print(f"  Phone:    {phone}")
         print(f"  Amount:   UGX {amount:,}")
+        # Defaults to PENDING, i.e. UNRESOLVED — matching verify_transaction
+        # above. Failing safe in test mode has to mean "we don't know yet",
+        # never "the money landed": a SUCCEEDED default writes the payout row
+        # "sent", and "sent" is indistinguishable from a real payout in the
+        # schema while no socket was ever opened. Override per-test with
+        # TEST_YO_PAYOUT_STATUS; read at call time so a test can set it
+        # after import.
+        fake_status = os.getenv("TEST_YO_PAYOUT_STATUS", "PENDING").strip().upper()
         return {
             "Status":            "OK",
-            "TransactionStatus": "SUCCEEDED",
+            "TransactionStatus": fake_status,
             "StatusMessage":     "TEST MODE — no real payout",
             "ExternalReference": ext_ref,
             "_Delivery":         _DELIVERY_RESPONDED,
@@ -526,12 +636,25 @@ async def disburse_to_merchant(
             response = await client.post(
                 YO_API_URL,
                 content=xml_request,
-                headers={"Content-Type": "application/xml"},
+                headers=_YO_HEADERS,
                 timeout=30.0,
             )
         result = parse_yo_response(response.text)
         result.setdefault("ExternalReference", ext_ref)
-        result["_Delivery"] = _DELIVERY_RESPONDED
+        # An unparseable body is an "unknown" delivery per the DELIVERY
+        # MARKERS contract at the top of this file, which already lists
+        # "unparseable body" alongside timeout and connection reset. The
+        # request WAS sent and no usable answer came back.
+        #
+        # Marking it "responded" let the caller see a Yo-shaped ERROR
+        # (manufactured by parse_yo_response above, not sent by Yo) and
+        # record the payout "failed" — the one status that unlocks a
+        # re-send, for a request that may already have paid the merchant.
+        result["_Delivery"] = (
+            _DELIVERY_UNKNOWN
+            if result.pop("_ParseFailed", False)
+            else _DELIVERY_RESPONDED
+        )
 
         print(
             f"Yo Uganda payout: {result.get('Status')} "

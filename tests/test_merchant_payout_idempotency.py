@@ -32,6 +32,35 @@ from app.models import Payout, Transaction
 from tests.conftest import headers_for, make_admin
 
 
+@pytest.fixture(autouse=True)
+def _payout_succeeds_in_test_mode():
+    """
+    This file tests payout IDEMPOTENCY and school scoping — "does a second
+    trigger send a second time", not "how is a Yo response classified".
+    Those assertions need the send to land "sent", so pin test mode's payout
+    result to SUCCEEDED.
+
+    momo.py's test-mode default is deliberately PENDING (fail-safe: a fake
+    success is indistinguishable from a real payout in the payouts schema),
+    so the success case has to be asked for explicitly. Tests that mock
+    disburse_to_merchant outright are unaffected by this.
+
+    Deliberately NOT via monkeypatch: test_failed_payout_can_be_retried
+    calls monkeypatch.undo() mid-test to restore the real disburse, and
+    undo() is all-or-nothing — it would take this env var with it and the
+    retry would come back PENDING.
+    """
+    prev = os.environ.get("TEST_YO_PAYOUT_STATUS")
+    os.environ["TEST_YO_PAYOUT_STATUS"] = "SUCCEEDED"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("TEST_YO_PAYOUT_STATUS", None)
+        else:
+            os.environ["TEST_YO_PAYOUT_STATUS"] = prev
+
+
 def _add_completed_payment(db_session, merchant, wallet, amount, when):
     db_session.add(Transaction(
         wallet_id=wallet.id,

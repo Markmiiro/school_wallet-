@@ -52,6 +52,47 @@ _YO_TX_STATUS_MAP = {
     "INDETERMINATE": "indeterminate",   # do not retry — poll
 }
 
+
+# ================================================
+# YO NUMERIC StatusCode (§ status code table)
+# ------------------------------------------------
+# StatusCode REFINES TransactionStatus; it never replaces it. Yo's own
+# guidance for several codes ("consider this SUCCEEDED", "consider this
+# FAILED") is written for a caller that can afford to be wrong once. We
+# cannot: "failed" is the only status in this module that unlocks another
+# send, so any code we are not certain about resolves to "indeterminate"
+# and gets polled instead.
+#
+# DELIBERATE DEVIATIONS FROM THE SPEC (both approved by the owner):
+#
+#   3  Yo says "consider FAILED". We map it INDETERMINATE. If Yo is right
+#      we lose nothing — the poll confirms FAILED and the retry proceeds
+#      one cycle later. If Yo is wrong we avoid paying a merchant twice.
+#      Asymmetric cost, so we take the slow side.
+#
+#   4  INDETERMINATE, which Yo says to consider SUCCEEDED. We follow Yo
+#      here and map it "sent", because "sent" does NOT unlock a re-send —
+#      it is the safe direction. Same for 6 (succeeded, balance lagging).
+#
+# PAYOUT ONLY. These codes must not be extended into topup.py, which
+# credits real wallet balances and may act only on an unambiguous
+# SUCCEEDED.
+# ================================================
+_YO_STATUS_CODE_MAP = {
+    "6":   ("sent",          "succeeded — Yo balance not yet updated"),
+    "4":   ("sent",          "INDETERMINATE — Yo says consider SUCCEEDED"),
+    "-30": ("failed",        "transaction not found — never reached Yo"),
+    "-13": ("failed",        "insufficient funds on the Yo account"),
+    "-21": ("failed",        "IP address not permitted"),
+    "-8":  ("indeterminate", "likely duplicate — an earlier attempt exists"),
+    "-6":  ("indeterminate", "duplicate transaction code"),
+    "-22": ("indeterminate", "requires extra authorization — spec: DO NOT RE-SUBMIT"),
+    "3":   ("indeterminate", "spec says FAILED; we poll instead (deliberate deviation)"),
+    "5":   ("indeterminate", "resolves within ~1 hour — poll"),
+    "9":   ("indeterminate", "resolves within ~1 hour — poll"),
+}
+
+
 # A "pending" row older than this had its process die mid-send. Its
 # reference is already recorded, so the resolver can poll it.
 _STALE_PENDING_MINUTES = 10
@@ -63,6 +104,46 @@ _STALE_PENDING_MINUTES = 10
 # account that another automated retry will not fix. The manual admin
 # trigger is deliberately NOT capped — a human looking at the row decides.
 _MAX_AUTOMATED_ATTEMPTS = 3
+
+
+def _status_code_of(result: dict) -> str:
+    """The numeric StatusCode as a bare string, or "" if Yo did not send one."""
+    raw = result.get("StatusCode")
+    return str(raw).strip() if raw is not None else ""
+
+
+def _refine_by_status_code(
+    status: str,
+    reason: str,
+    result: dict,
+) -> tuple:
+    """
+    Let the numeric StatusCode sharpen a status already derived from
+    TransactionStatus.
+
+    HARD RULE: refinement may never on its own produce "failed". Reaching
+    "failed" is what permits another send, and a numeric code sitting
+    alongside a TransactionStatus is commentary on that status, not a
+    contradiction of it. Codes that mean "failed" are only honoured by
+    _classify_payout_result() when there is NO TransactionStatus at all,
+    i.e. a request-level rejection where nothing was ever attempted.
+    """
+    code = _status_code_of(result)
+    if not code or code not in _YO_STATUS_CODE_MAP:
+        return status, reason
+
+    refined, detail = _YO_STATUS_CODE_MAP[code]
+
+    if refined == status:
+        return status, reason
+
+    if refined == "failed":
+        # The code alone must not unlock a re-send. Yo gave us BOTH a
+        # TransactionStatus that was not FAILED and a failure code — that
+        # disagreement is exactly what polling is for.
+        return "indeterminate", f"{reason} (StatusCode {code}: {detail}) — not retried"
+
+    return refined, f"{reason} (StatusCode {code}: {detail})"
 
 
 def _payout_narrative(merchant_name: str, payout_date: date) -> str:
@@ -133,24 +214,58 @@ def _classify_payout_result(result: dict) -> tuple:
 
     tx = (result.get("TransactionStatus") or "").strip().upper()
     if tx in _YO_TX_STATUS_MAP:
-        return _YO_TX_STATUS_MAP[tx], f"Yo reported {tx}"
+        return _refine_by_status_code(
+            _YO_TX_STATUS_MAP[tx], f"Yo reported {tx}", result
+        )
 
     # Yo answered, but not with one of its four documented statuses.
     if tx:
-        return "indeterminate", f"unrecognised TransactionStatus {tx!r}"
+        return _refine_by_status_code(
+            "indeterminate", f"unrecognised TransactionStatus {tx!r}", result
+        )
 
-    # No TransactionStatus at all — a request-level rejection.
-    #
-    # TODO(yo): get the numeric StatusCode that means "duplicate rejected".
-    # A duplicate rejection means an EARLIER identical withdrawal already
-    # exists, so recording it "failed" and retrying with a fresh tuple
-    # would pay the merchant twice — the exact opposite of the right move.
-    # Until Yo answers, match on the message and fail safe.
-    if "duplicat" in msg.lower():
-        return "indeterminate", f"duplicate rejected — an earlier attempt exists: {msg}"
+    # No TransactionStatus at all — a request-level rejection. This is the
+    # ONLY place a numeric code may produce "failed" on its own, because
+    # here there is no attempted transaction for it to contradict: Yo threw
+    # the request out before it became one.
+    code = _status_code_of(result)
+    if code in _YO_STATUS_CODE_MAP:
+        mapped, detail = _YO_STATUS_CODE_MAP[code]
+        return mapped, f"Yo StatusCode {code}: {detail}" + (f" — {msg}" if msg else "")
 
-    if result.get("Status") == "OK":
+    # An unmapped code with no TransactionStatus: we do not know what Yo
+    # did with the request, so fail closed rather than unlocking a re-send.
+    if code:
+        return "indeterminate", f"unrecognised StatusCode {code!r}: {msg or 'no detail'}"
+
+    status_field = (result.get("Status") or "").strip().upper()
+
+    if status_field == "OK":
         return "indeterminate", "Yo returned OK with no TransactionStatus"
+
+    # No Status field AT ALL — whatever came back is not a Yo answer. An
+    # HTML error page from a proxy or WAF parses as XML perfectly well and
+    # flattens to its own tags (title, body, ...), carrying none of Yo's.
+    # httpx does not raise for HTTP status and disburse_to_merchant() does
+    # not check response.status_code, so such a body arrives here marked
+    # _Delivery="responded". The request reached SOMETHING; the money's
+    # fate is unknown, and it must not be recorded "failed" — the one
+    # status that unlocks another send.
+    #
+    # SCOPE: this catches a body that PARSED but is not a Yo answer. A
+    # body that fails to parse at all (empty, truncated, plain text) never
+    # reaches here — parse_yo_response() flags it _ParseFailed and
+    # disburse_to_merchant() maps that to _Delivery="unknown", which
+    # returns at the top of this function. Both halves are needed: without
+    # the momo.py marker an unparseable body arrives wearing a
+    # manufactured {"Status": "ERROR"} and is indistinguishable from a
+    # genuine Yo rejection. See tests/test_payout_resolution_gaps.py.
+    if not status_field:
+        seen = sorted(k for k in result if not k.startswith("_"))
+        return "indeterminate", (
+            "response was not a Yo answer (no Status field) — fate unknown; "
+            f"parsed fields: {seen[:5]}"
+        )
 
     return "failed", msg or "Payout failed"
 
@@ -186,20 +301,36 @@ async def _resolve_payout(db: Session, payout: Payout) -> dict:
 
     tx = (result.get("TransactionStatus") or "").strip().upper()
 
+    # The numeric StatusCode refines the status check exactly as it refines a
+    # send (see _refine_by_status_code). It matters more here: code 4 or 6 on
+    # a still-PENDING check is Yo telling us the money landed and its own
+    # balance simply has not caught up, and a code that disagrees with a
+    # FAILED must not be allowed to hand back a re-send licence.
     if tx == "SUCCEEDED":
+        status, reason = "sent", "Yo confirmed SUCCEEDED"
+    elif tx == "FAILED":
+        status, reason = "failed", "Yo confirmed FAILED"
+    elif tx:
+        status, reason = "indeterminate", f"Yo still reports {tx}"
+    else:
+        status, reason = "indeterminate", "status check returned no TransactionStatus"
+
+    status, reason = _refine_by_status_code(status, reason, result)
+
+    if status == "sent":
         payout.status = "sent"
         payout.completed_at = datetime.utcnow()
         db.commit()
-        return {"outcome": "sent", "reason": "Yo confirmed SUCCEEDED"}
+        return {"outcome": "sent", "reason": reason}
 
-    if tx == "FAILED":
+    if status == "failed":
         payout.status = "failed"
         payout.completed_at = datetime.utcnow()
         db.commit()
-        return {"outcome": "failed", "reason": "Yo confirmed FAILED — retry permitted"}
+        return {"outcome": "failed", "reason": f"{reason} — retry permitted"}
 
-    # PENDING / INDETERMINATE / anything else: leave the row alone.
-    return {"outcome": "unresolved", "reason": f"Yo still reports {tx or 'no status'}"}
+    # Anything else: leave the row alone and poll again later.
+    return {"outcome": "unresolved", "reason": reason}
 
 
 # ================================================
