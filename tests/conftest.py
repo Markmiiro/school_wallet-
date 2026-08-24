@@ -90,7 +90,7 @@ def db_session():
 def _build_test_app():
     from app.routes import (
         payments, tuckshop, merchants, webhook, auth as auth_routes,
-        students, topup, schools, users, reports,
+        students, topup, schools, users, reports, diagnostics,
     )
 
     app = FastAPI()
@@ -104,6 +104,7 @@ def _build_test_app():
     app.include_router(schools.router, prefix="/schools", tags=["Schools"])
     app.include_router(users.router, prefix="/users", tags=["Users"])
     app.include_router(reports.router, prefix="/reports", tags=["Reports & Settlement"])
+    app.include_router(diagnostics.router, prefix="/diagnostics", tags=["Diagnostics"])
     return app
 
 

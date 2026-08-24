@@ -16,6 +16,7 @@ from app.routes import analytics
 from app.routes import auth
 from app.routes import tuckshop
 from app.routes import issue
+from app.routes import diagnostics
 
 
 
@@ -71,3 +72,4 @@ app.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(tuckshop.router, prefix="/tuckshop", tags=["Tuck Shop"])
 app.include_router(issue.router, prefix="/issue", tags=["Card Issuance"])
+app.include_router(diagnostics.router, prefix="/diagnostics", tags=["Diagnostics"])
