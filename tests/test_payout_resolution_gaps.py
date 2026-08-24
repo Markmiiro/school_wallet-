@@ -69,6 +69,11 @@ def _responded(body: str, monkeypatch, throwaway_key) -> dict:
     """
     class _Response:
         text = body
+        # httpx.Response always carries this; disburse_to_merchant logs it
+        # before parsing. A double missing it made the log line raise, and
+        # the raise was caught as a delivery failure — which is exactly the
+        # confusion this class of test exists to catch.
+        status_code = 200
 
     class _StubAsyncClient:
         async def __aenter__(self):

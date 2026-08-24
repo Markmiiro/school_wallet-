@@ -251,6 +251,51 @@ def parse_yo_response(xml_text: str) -> dict:
         return {"Status": "ERROR", "StatusMessage": str(e), "_ParseFailed": True}
 
 
+# Cap on how much of a Yo reply reaches the log. Long enough for a whole
+# Yo XML response and the useful head of a proxy error page; short enough
+# that a runaway HTML body cannot flood the deploy log.
+_YO_LOG_BODY_MAX = 2000
+
+
+def _log_yo_response(context: str, status_code: int, body: str) -> None:
+    """
+    Print Yo's raw reply — HTTP status and body — BEFORE anything
+    interprets it.
+
+    The body is the only artefact that can separate a genuine Yo
+    rejection from a proxy error page that merely parses as XML, and
+    until now nothing kept it: response.text went straight into
+    parse_yo_response() and was dropped. When a payout came back
+    ambiguous there was nothing left to say why.
+
+    Logged here and not in parse_yo_response() because this is where the
+    HTTP status code still exists — httpx does not raise for status, and
+    the caller never checks it, so a 502 error page and a 200 rejection
+    are otherwise indistinguishable downstream.
+
+    RESPONSE ONLY, NEVER THE REQUEST. The request XML carries
+    APIUsername, APIPassword and the withdraw signature. None of that may
+    reach a log. Yo's reply carries none of it.
+    """
+    # This runs INSIDE disburse_to_merchant's and verify_transaction's try
+    # block, where an exception is caught and turned into
+    # _Delivery="unknown". A bug in a log line would therefore convert a
+    # Yo-confirmed FAILED into "indeterminate" — changing whether a
+    # merchant can be paid again. Diagnostics may never do that, so this
+    # swallows everything it might throw.
+    try:
+        body = body or ""
+        shown = body[:_YO_LOG_BODY_MAX]
+        suffix = (
+            f"... [truncated, {len(body)} chars total]"
+            if len(body) > _YO_LOG_BODY_MAX
+            else ""
+        )
+        print(f"Yo raw response [{context}] HTTP {status_code}: {shown}{suffix}")
+    except Exception as e:  # pragma: no cover — defensive only
+        print(f"Yo raw response [{context}]: could not be logged ({e})")
+
+
 def _is_test_mode() -> bool:
     """
     True when we should fake responses instead of calling Yo Uganda.
@@ -495,6 +540,10 @@ async def verify_transaction(tx_ref: str) -> dict:
                 headers=_YO_HEADERS,
                 timeout=30.0,
             )
+        # Same reasoning as the payout path: this is the last point the
+        # real reply exists, and the only point the HTTP status does.
+        _log_yo_response(f"status check ref {tx_ref}", response.status_code, response.text)
+
         result = parse_yo_response(response.text)
         result["_Delivery"] = _DELIVERY_RESPONDED
         return result
@@ -639,6 +688,11 @@ async def disburse_to_merchant(
                 headers=_YO_HEADERS,
                 timeout=30.0,
             )
+        # Before parse_yo_response() touches it — a body that fails to
+        # parse is replaced by a manufactured {"Status": "ERROR", ...}
+        # dict, so this is the last point the real reply exists.
+        _log_yo_response(f"payout ref {ext_ref}", response.status_code, response.text)
+
         result = parse_yo_response(response.text)
         result.setdefault("ExternalReference", ext_ref)
         # An unparseable body is an "unknown" delivery per the DELIVERY
@@ -650,10 +704,17 @@ async def disburse_to_merchant(
         # (manufactured by parse_yo_response above, not sent by Yo) and
         # record the payout "failed" — the one status that unlocks a
         # re-send, for a request that may already have paid the merchant.
+        parse_failed = result.pop("_ParseFailed", False)
+        if parse_failed:
+            # The classifier will see a Yo-shaped ERROR that Yo never
+            # sent. Say so explicitly next to the raw body logged above,
+            # so the two are read together.
+            print(
+                f"Yo Uganda payout: RESPONSE DID NOT PARSE — ref {ext_ref} — "
+                f"delivery marked unknown, NOT failed. See raw response above."
+            )
         result["_Delivery"] = (
-            _DELIVERY_UNKNOWN
-            if result.pop("_ParseFailed", False)
-            else _DELIVERY_RESPONDED
+            _DELIVERY_UNKNOWN if parse_failed else _DELIVERY_RESPONDED
         )
 
         print(
