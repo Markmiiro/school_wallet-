@@ -27,13 +27,26 @@ def test_page_sends_auth_header_on_payment(client):
     assert "headers: authHeaders()" in body
 
 
-def test_merchant_school_lookup_used_by_the_page_is_public(client, merchant, school):
-    # afterLogin() calls this with no special auth beyond the bearer token
-    # it always sends — confirms the endpoint the page depends on exists
-    # and returns the shape the JS expects (a "merchants" list).
-    r = client.get(f"/merchants/school/{school.id}")
+def test_merchant_school_lookup_used_by_the_page_works_for_staff(client, merchant, school, staff_headers):
+    # afterLogin() calls this with the bearer token it always sends —
+    # confirms the endpoint the page depends on exists, accepts a till
+    # login, and returns the shape the JS expects (a "merchants" list).
+    r = client.get(f"/merchants/school/{school.id}", headers=staff_headers)
     assert r.status_code == 200
     assert "merchants" in r.json()
+    # Till staff do not need (and no longer get) the payout phone number.
+    assert "momo_phone" not in r.json()["merchants"][0]
+
+
+def test_merchant_school_lookup_is_not_public(client, merchant, school):
+    assert client.get(f"/merchants/school/{school.id}").status_code == 401
+
+
+def test_page_sends_auth_header_on_card_check(client):
+    # /tuckshop/check returns a child's name and balance and now needs the
+    # bearer token; the page must send it or every tap fails.
+    body = client.get("/tuckshop/").text
+    assert "/tuckshop/check?tag_uid=${uid}`,\n            { headers: authHeaders() }" in body
 
 
 def test_page_queues_offline_payments_with_a_request_id(client):

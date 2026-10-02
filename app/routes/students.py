@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Student, Wallet, NFCTag, School, User
+from app.models import Student, Wallet, NFCTag, School, User, CardOrder
 from app.account_number import generate_account_number
 from app.auth import (
     get_current_user,
@@ -15,6 +15,7 @@ from app.auth import (
     assert_school_access,
     visible_school_id,
 )
+from app.permissions import clean_name
 
 router = APIRouter()
 
@@ -120,6 +121,8 @@ def create_student(
 
     # A scoped admin can only create students in their own school
     assert_school_access(current_admin, school_id)
+
+    name = clean_name(name, what="Student name")
 
     # Check school exists
     school = db.query(School).filter(School.id == school_id).first()
@@ -303,30 +306,56 @@ def get_students_by_parent(
 
 # ================================================
 # PUT /students/{student_id}/assign-nfc
-# Assign a physical NFC card to a student
-# (Manual override / fallback path — used when a student's tag
-#  was created as an empty placeholder because stock was empty
-#  at registration time, or to fix/replace a tag later.)
+# Link a physical NFC card to a student, by the card's number.
+#
+# tag_uid is the card number: the card's UID in hex, either read by
+# tapping (the school's /issue/ page) or typed in by hand (the parent
+# app, and the /issue/ page's manual entry).
+#
+# Callable by:
+#   - an admin scoped to the student's school (or a super admin) —
+#     may link a first card, or REPLACE a working one;
+#   - the student's own parent — may link a card only when the child
+#     has no working card (never issued, or reported lost/stolen).
+#     Swapping out a card that still works stays a school action, so a
+#     mistyped number in the app can never silently retire a good card.
+#
+# Nobody creates students here. The student must already exist.
 # ================================================
 @router.put("/{student_id}/assign-nfc")
 def assign_nfc_tag(
     student_id: int,
     tag_uid: str,
     db: Session = Depends(get_db),
-    current_admin: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Assign a physical NFC card to a student.
-    Once assigned, the student can tap to pay at the tuck shop.
+    Link a physical NFC card to a student.
+    Once linked, the student can tap to pay at the tuck shop.
     """
     # Check student exists
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    # A Seeta admin cannot issue cards at Kampala Parents.
-    # Note the school comes from the STUDENT, never from the request.
-    assert_school_access(current_admin, student.school_id)
+    if current_user.role == "admin":
+        # A Seeta admin cannot issue cards at Kampala Parents.
+        # Note the school comes from the STUDENT, never from the request.
+        assert_school_access(current_user, student.school_id)
+    elif current_user.role == "parent":
+        if student.parent_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not permitted")
+        working = student.active_nfc_tag
+        if working is not None and working.tag_uid is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{student.name} already has a working card. Report it "
+                    f"lost or stolen first, or ask the school to replace it."
+                ),
+            )
+    else:
+        raise HTTPException(status_code=403, detail="Not permitted")
 
     uid = normalize_uid(tag_uid)
 
@@ -338,7 +367,10 @@ def assign_nfc_tag(
     if already_used:
         raise HTTPException(
             status_code=400,
-            detail=f"NFC tag {uid} has already been issued and cannot be reused"
+            detail=(
+                f"Card {uid} is already linked or was retired, and cannot be "
+                f"used again. Check the number, or ask the school."
+            ),
         )
 
     active = student.active_nfc_tag
@@ -364,6 +396,16 @@ def assign_nfc_tag(
         active.deactivated_at = datetime.utcnow()
         nfc = NFCTag(student_id=student_id, tag_uid=uid, is_active=True, status="active")
         db.add(nfc)
+
+    # A card bought in the app (app/routes/cards.py) has now been handed
+    # over: close the order so the school's list of cards owed is right
+    # and the parent can buy again if this card is ever lost.
+    db.query(CardOrder).filter(
+        CardOrder.student_id == student_id, CardOrder.status == "paid",
+    ).update(
+        {"status": "fulfilled", "fulfilled_at": datetime.utcnow()},
+        synchronize_session=False,
+    )
 
     db.commit()
 

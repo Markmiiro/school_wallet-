@@ -40,7 +40,7 @@ def test_money_columns_are_integer_type():
 
 
 def test_many_sequential_payments_net_out_to_exact_integer_balance(
-    client, db_session, school, parent_user, merchant, auth_headers
+    client, db_session, school, parent_user, merchant, staff_headers
 ):
     student, wallet, nfc = make_student_with_wallet(
         db_session, school, parent_user, balance=1_000_000, daily_limit=1_000_000,
@@ -58,7 +58,7 @@ def test_many_sequential_payments_net_out_to_exact_integer_balance(
                 "request_id": f"drift-check-{i}",
                 "description": "drift check",
             },
-            headers=auth_headers,
+            headers=staff_headers,
         )
         assert res.status_code == 200
         total_spent += amount

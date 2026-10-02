@@ -299,3 +299,41 @@ class Payout(Base):
 
     # Relationships
     merchant = relationship("Merchant")
+
+
+# ════════════════════════════════════════════════
+# CARD ORDERS
+# A Smart Card paid for from the parent app, for a child who already
+# exists (the USSD flow creates the child and the card slot together;
+# this is the card on its own). See app/routes/cards.py.
+#
+# Deliberately NOT a row in `transactions`: webhook.py credits the
+# wallet for any pending Transaction whose reference Yo confirms, so a
+# card fee recorded there would be paid into the child's wallet as if
+# it were a top-up. Keeping card fees in their own table means the
+# webhook finds nothing for a CARD-… reference and does nothing.
+#
+# status: pending | paid | failed | fulfilled
+#   pending   → charge sent, parent has not approved yet
+#   paid      → Yo confirmed the money; the school owes the child a card
+#   failed    → rejected, timed out, or the charge never started
+#   fulfilled → a card was linked to the child after payment
+# ════════════════════════════════════════════════
+class CardOrder(Base):
+    __tablename__ = "card_orders"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    student_id   = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
+    ordered_by   = Column(Integer, ForeignKey("users.id"), nullable=False)
+    card_color   = Column(String, nullable=False)    # Blue | Green | Yellow | Red
+    amount       = Column(Integer, nullable=False)   # UGX
+    status       = Column(String, nullable=False, default="pending")
+    reference    = Column(String, nullable=False, unique=True)  # Yo ExternalReference, CARD-{uuid}
+    momo_phone   = Column(String, nullable=False)
+    network      = Column(String, nullable=False)
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    paid_at      = Column(DateTime, nullable=True)
+    fulfilled_at = Column(DateTime, nullable=True)
+
+    # Relationships
+    student = relationship("Student")

@@ -14,7 +14,7 @@
 # 7. Webhook credits wallet and sends SMS to parent
 # ================================================
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
 from typing import Optional
@@ -25,8 +25,20 @@ from app.database import get_db
 from app.models import Transaction, Wallet, Student, User
 from app.momo import charge_mobile_money, verify_transaction
 from app.auth import get_current_user
+from app.permissions import assert_wallet_access
 
 router = APIRouter()
+
+
+def _assert_can_use_wallet(db: Session, user: User, wallet: Wallet) -> None:
+    """
+    A parent may fund and inspect only their own children's wallets;
+    staff only wallets of students at their own school. Previously any
+    logged-in user could start a top-up against, or read the top-up
+    history (payer phone numbers included) of, any wallet id.
+    """
+    student = db.query(Student).filter(Student.id == wallet.student_id).first()
+    assert_wallet_access(user, student)
 
 
 # ================================================
@@ -107,6 +119,8 @@ async def initiate_topup(
             status_code=404,
             detail=f"Wallet not found: {topup_data.wallet_id}"
         )
+
+    _assert_can_use_wallet(db, current_user, wallet)
 
     if not wallet.is_active:
         raise HTTPException(
@@ -224,6 +238,10 @@ async def check_topup_status(
             detail=f"No transaction found: {reference_id}"
         )
 
+    txn_wallet = db.query(Wallet).filter(Wallet.id == txn.wallet_id).first()
+    if txn_wallet is not None:
+        _assert_can_use_wallet(db, current_user, txn_wallet)
+
     # ── If still pending — ask Yo Uganda ─────────
     if txn.status == "pending":
         try:
@@ -260,9 +278,21 @@ async def check_topup_status(
                 )
 
                 if txn.status != "completed":
-                    wallet = db.query(Wallet).filter(
-                        Wallet.id == txn.wallet_id
-                    ).first()
+                    # Lock the wallet row too. Without it this credit
+                    # reads the balance, a concurrent tuck-shop payment
+                    # (which does lock the wallet) commits its debit, and
+                    # this then writes back a balance computed from the
+                    # stale read — the debit is lost. populate_existing()
+                    # for the same reason as on the transaction above:
+                    # the wallet is already in this session's identity
+                    # map from the ownership check.
+                    wallet = (
+                        db.query(Wallet)
+                        .filter(Wallet.id == txn.wallet_id)
+                        .populate_existing()
+                        .with_for_update()
+                        .first()
+                    )
                     if wallet:
                         wallet.balance += txn.amount
                     txn.status = "completed"
@@ -309,7 +339,7 @@ async def check_topup_status(
 @router.get("/history/{wallet_id}")
 def get_topup_history(
     wallet_id: int,
-    limit: int = 10,
+    limit: int = Query(default=10, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -321,6 +351,8 @@ def get_topup_history(
             status_code=404,
             detail=f"Wallet not found: {wallet_id}"
         )
+
+    _assert_can_use_wallet(db, current_user, wallet)
 
     topups = (
         db.query(Transaction)

@@ -1,18 +1,21 @@
 """
-Admin card console — login, issue NFC cards, look up account numbers.
+Admin card console — login, link NFC cards to students (by tapping the
+card, or by typing its card number), look up account numbers.
 
 Mount in main.py:
     from app.routes import issue
     app.include_router(issue.router, prefix="/issue", tags=["Card Issuance"])
 
-Open on an Android phone in Chrome to issue cards:
+Open on an Android phone in Chrome to link cards by tapping:
     https://<host>/issue/
-Desktop works for lookup only — Web NFC is Android-Chrome only.
+Any other browser links cards by typed card number — Web NFC is
+Android-Chrome only.
 
 Endpoints used (all already exist):
     POST /auth/login                  -> {phone, pin} JSON, returns {token, user}
     GET  /students/                   -> account_number + nested nfc {tag_uid, status}
     GET  /schools/                    -> school filter
+    GET  /cards/orders/owed           -> cards parents have paid for in the app
     PUT  /students/{id}/assign-nfc    -> bind a card
 
 SECURITY NOTE: the role check in this page is cosmetic. Hiding a button does not
@@ -87,6 +90,8 @@ PAGE = r"""
          color:#8b93a1;white-space:nowrap}
   .badge.ok{background:#0d3b2e;color:#00d4aa}
   .badge.warn{background:#3a2c10;color:#ffb84d}
+  .badge.paid{background:#00d4aa;color:#06231c;font-weight:600}
+  .row.paid{border-color:#00d4aa}
   .overlay{position:fixed;inset:0;background:rgba(15,17,21,.97);display:none;
            flex-direction:column;align-items:center;justify-content:center;
            padding:28px;text-align:center;z-index:30}
@@ -98,6 +103,13 @@ PAGE = r"""
   .obtn{margin-top:22px;padding:13px 26px;font-size:15px;border:0;border-radius:8px;
         background:#262b36;color:#e8eaed;font-weight:500}
   .obtn.primary{background:#00d4aa;color:#06231c}
+  .manual{display:none;margin-top:20px;width:100%;max-width:320px}
+  .manual.show{display:block}
+  .manual label{display:block;font-size:12.5px;color:#8b93a1;margin-bottom:6px}
+  .manual input{width:100%;text-align:center;letter-spacing:1.5px;
+                font-family:ui-monospace,Menlo,monospace;text-transform:uppercase}
+  .manual .merr{color:#ff9b9b;font-size:12.5px;min-height:18px;margin-top:6px}
+  .manual .obtn{margin-top:8px;width:100%}
   .warn-box{background:#3a1a1a;color:#ff9b9b;padding:11px 14px;margin:10px 12px;
             border-radius:8px;font-size:13.5px;line-height:1.45}
   .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
@@ -143,6 +155,7 @@ PAGE = r"""
       <input type="text" id="q" placeholder="Name or account number…" autocomplete="off">
       <select id="school"><option value="">All schools</option></select>
       <span class="chip" id="filterChip" onclick="toggleFilter()">No card only</span>
+      <span class="chip" id="paidChip" onclick="togglePaid()">Paid, to hand over</span>
     </div>
   </header>
 
@@ -155,6 +168,13 @@ PAGE = r"""
   <div class="msg" id="oMsg"></div>
   <div class="osub" id="oSub"></div>
   <div class="uid" id="oUid"></div>
+  <div class="manual" id="oManual">
+    <label for="oManualUid">Card number</label>
+    <input type="text" id="oManualUid" placeholder="e.g. 04A21B55"
+           autocomplete="off" autocapitalize="characters" spellcheck="false">
+    <div class="merr" id="oManualErr"></div>
+    <button class="obtn primary" onclick="manualAssign()">Link this card</button>
+  </div>
   <button class="obtn" id="oBtn" onclick="closeOverlay()">Cancel</button>
 </div>
 
@@ -164,6 +184,8 @@ PAGE = r"""
 const API = location.origin;
 let TOKEN = null, ME = null;
 let students = [], selected = null, scanning = false, onlyNoCard = false;
+// Cards paid for in the parent app and not yet linked, by student id.
+let owed = {}, onlyPaid = false;
 
 const esc = s => String(s ?? '').replace(/[<>&"]/g, c =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
@@ -265,13 +287,19 @@ const statusOf = s => (s.nfc && s.nfc.status)  || 'no card slot';
 
 async function load(){
   try {
-    const [sRes, schRes] = await Promise.all([
+    const [sRes, schRes, oRes] = await Promise.all([
       fetch(API + '/students/', {headers:H()}),
-      fetch(API + '/schools/',  {headers:H()}).catch(()=>null)
+      fetch(API + '/schools/',  {headers:H()}).catch(()=>null),
+      fetch(API + '/cards/orders/owed', {headers:H()}).catch(()=>null)
     ]);
     if (sRes.status === 401){ sessionExpired(); return; }
     if (!sRes.ok) throw new Error('students HTTP ' + sRes.status);
     students = await sRes.json();
+
+    owed = {};
+    if (oRes && oRes.ok){
+      for (const o of (await oRes.json()).orders) owed[o.student_id] = o;
+    }
 
     if (schRes && schRes.ok){
       const schools = await schRes.json();
@@ -291,29 +319,42 @@ function toggleFilter(){
   render();
 }
 
+function togglePaid(){
+  onlyPaid = !onlyPaid;
+  document.getElementById('paidChip').classList.toggle('on', onlyPaid);
+  render();
+}
+
 function render(){
   const q      = document.getElementById('q').value.trim().toLowerCase();
   const school = document.getElementById('school').value;
   const issued = students.filter(uidOf).length;
 
+  const owedCount = students.filter(s => owed[s.id]).length;
   document.getElementById('count').textContent =
-    `${issued} of ${students.length} students have cards`;
+    `${issued} of ${students.length} students have cards`
+    + (owedCount ? ` · ${owedCount} paid for, to hand over` : '');
 
   const rows = students
     .filter(s => !school || String(s.school_id) === school)
     .filter(s => !onlyNoCard || !uidOf(s))
+    .filter(s => !onlyPaid || owed[s.id])
     .filter(s => !q
       || (s.name || '').toLowerCase().includes(q)
       || (s.account_number || '').includes(q))
-    .sort((a,b) => (uidOf(a)?1:0) - (uidOf(b)?1:0)
+    .sort((a,b) => (owed[a.id]?0:1) - (owed[b.id]?0:1)
+                || (uidOf(a)?1:0) - (uidOf(b)?1:0)
                 || (a.name||'').localeCompare(b.name||''))
     .map(s => {
       const uid = uidOf(s);
-      const badge = uid ? '<span class="badge ok">Issued</span>'
+      const order = owed[s.id];
+      const badge = order
+        ? `<span class="badge paid">Paid · ${esc(order.card_color)}</span>`
+        : uid ? '<span class="badge ok">Issued</span>'
         : statusOf(s) === 'no card slot' ? '<span class="badge warn">No slot</span>'
-        : '<span class="badge">Tap to issue</span>';
+        : '<span class="badge">Link card</span>';
       return `
-      <div class="row ${uid?'issued':''}" onclick="pick(${s.id})">
+      <div class="row ${order?'paid':uid?'issued':''}" onclick="pick(${s.id})">
         <div style="min-width:0">
           <div class="nm">${esc(s.name)}</div>
           <div class="acct" onclick="copyAcct(event,'${esc(s.account_number||'')}')">
@@ -347,9 +388,42 @@ function pick(id){
   }
   if (uidOf(s) && !confirm(`${s.name} already has card ${uidOf(s)}.\n\nReplace it?`)) return;
   selected = s;
-  showOverlay('📲','Tap the card now', `${s.name} · ${s.account_number || ''}`,'',null);
-  startScan();
+  const canTap = 'NDEFReader' in window;
+  showOverlay(canTap ? '📲' : '⌨️',
+    canTap ? 'Tap the card, or type its number' : 'Type the card number',
+    `${s.name} · ${s.account_number || ''}`
+      + (owed[s.id] ? ` · paid for a ${owed[s.id].card_color} card` : ''),'',null);
+  showManual();
+  if (canTap) startScan();
 }
+
+// ── Link by typed card number ──────────────────────
+// The card number is the card's UID in hex. Same endpoint and same
+// server-side checks as a tapped card.
+function showManual(){
+  const input = document.getElementById('oManualUid');
+  input.value = '';
+  document.getElementById('oManualErr').textContent = '';
+  document.getElementById('oManual').classList.add('show');
+  input.focus();
+}
+
+function manualAssign(){
+  if (!selected) return;
+  const uid = document.getElementById('oManualUid').value
+    .replace(/[^0-9a-fA-F]/g,'').toUpperCase();
+  // 4 to 10 bytes, matching normalize_uid() on the server.
+  if (uid.length < 8 || uid.length > 20 || uid.length % 2){
+    document.getElementById('oManualErr').textContent =
+      'Enter the full card number: 8 to 20 characters, digits and A to F only.';
+    return;
+  }
+  assign(selected, uid);
+}
+
+document.getElementById('oManualUid').addEventListener('keydown', e => {
+  if (e.key === 'Enter') manualAssign();
+});
 
 function showOverlay(icon,msg,sub,uid,btn){
   document.getElementById('oIcon').textContent = icon;
@@ -360,6 +434,7 @@ function showOverlay(icon,msg,sub,uid,btn){
   b.textContent = btn || 'Cancel';
   b.className   = btn ? 'obtn primary' : 'obtn';
   b.onclick     = closeOverlay;
+  document.getElementById('oManual').classList.remove('show');
   document.getElementById('overlay').classList.add('show');
 }
 function closeOverlay(){
@@ -371,10 +446,10 @@ async function startScan(){
   if (!('NDEFReader' in window)){
     const w = document.getElementById('nfcWarn');
     w.style.display = 'block';
-    w.innerHTML = 'NFC not available in this browser. Issuing cards needs '
+    w.innerHTML = 'NFC not available in this browser. Tapping cards needs '
       + '<b>Chrome on Android</b> with NFC switched on. '
-      + 'Lookup and account numbers still work here.';
-    closeOverlay(); return;
+      + 'You can still link a card by typing its number.';
+    return;
   }
   if (scanning) return;
   try {
@@ -388,8 +463,8 @@ async function startScan(){
   } catch(e){
     const w = document.getElementById('nfcWarn');
     w.style.display = 'block';
-    w.textContent = 'NFC permission denied or unavailable: ' + e.message;
-    closeOverlay();
+    w.textContent = 'NFC permission denied or unavailable: ' + e.message
+      + ' — type the card number instead.';
   }
 }
 
@@ -405,6 +480,7 @@ async function assign(student, uid){
 
     if (res.ok){
       target.nfc = {tag_uid: uid, status: 'assigned'};
+      delete owed[target.id];   // the server closed the order on linking
       render();
       showOverlay('✅','Card issued',
         `${target.name} · ${target.account_number || ''}`, uid, 'Next student');

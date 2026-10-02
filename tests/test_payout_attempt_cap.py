@@ -434,3 +434,23 @@ def test_resolver_leaves_a_fresh_pending_row_alone(
     db_session.expire_all()
     row = db_session.query(Payout).filter_by(merchant_id=merchant.id).one()
     assert row.status == "pending"
+
+
+def test_auto_payout_refuses_without_a_configured_secret(
+    client, db_session, school, monkeypatch,
+):
+    """The old hardcoded default must not open the endpoint when the
+    variable is unset, and a wrong secret is still a 403 when it is set."""
+    from tests.conftest import headers_for, make_admin
+
+    headers = headers_for(make_admin(db_session, school, phone="256700999021"))
+
+    monkeypatch.delenv("SETTLEMENT_SECRET", raising=False)
+    r = client.post(
+        "/reports/settlements/auto?secret=school_wallet_settle_2026", headers=headers
+    )
+    assert r.status_code == 503
+
+    monkeypatch.setenv("SETTLEMENT_SECRET", SETTLEMENT_SECRET)
+    r = client.post("/reports/settlements/auto?secret=wrong", headers=headers)
+    assert r.status_code == 403

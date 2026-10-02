@@ -4,7 +4,9 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import NFCTag, Wallet, Student
+from app.models import NFCTag, Wallet, Student, User
+from app.auth import get_current_user
+from app.permissions import assert_staff, assert_till_staff
 
 router = APIRouter()
 
@@ -635,7 +637,11 @@ async function onStudentTap(uid) {
         '<h2 style="margin-top:16px; color:#00d4aa">Loading...</h2>';
 
     try {
-        const res  = await fetch(`${API_BASE}/tuckshop/check?tag_uid=${uid}`);
+        const res  = await fetch(
+            `${API_BASE}/tuckshop/check?tag_uid=${uid}`,
+            { headers: authHeaders() }
+        );
+        if (res.status === 401) { sessionExpired(); resetWaiting(); return; }
         const data = await res.json();
 
         if (res.ok) {
@@ -875,8 +881,20 @@ function hide(id) {
 
 
 @router.get("/check")
-def check_nfc_tag(tag_uid: str, db: Session = Depends(get_db)):
-    """Check student info from NFC tag UID."""
+def check_nfc_tag(
+    tag_uid: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Check student info from NFC tag UID.
+
+    Staff only, and only for cards of students at the caller's own
+    school — this returns a child's name and balance, and used to do so
+    for anyone who could supply a card UID.
+    """
+    assert_staff(current_user)
+
     nfc = db.query(NFCTag).filter(NFCTag.tag_uid == tag_uid).first()
     if not nfc:
         return JSONResponse(
@@ -902,6 +920,8 @@ def check_nfc_tag(tag_uid: str, db: Session = Depends(get_db)):
     student = db.query(Student).filter(
         Student.id == nfc.student_id
     ).first()
+
+    assert_till_staff(current_user, student.school_id if student else None)
 
     return JSONResponse(content={
         "tag_uid":      tag_uid,

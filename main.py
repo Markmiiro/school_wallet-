@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import test_connection, create_tables
@@ -17,6 +19,7 @@ from app.routes import auth
 from app.routes import tuckshop
 from app.routes import issue
 from app.routes import diagnostics
+from app.routes import cards
 
 
 
@@ -29,10 +32,27 @@ app = FastAPI(
 )
 
 # ── CORS ────────────────────────────────────────
+# Only browser front-ends we actually ship may call this API from
+# another origin. The tuck shop and card pages are served by this app
+# itself (same origin) and native mobile builds are not subject to CORS,
+# so neither needs an entry here.
+#
+# CORS_ORIGINS: comma-separated list, set in Railway → Variables to add
+# or change origins without a code change. Local development on any
+# localhost port is always allowed. Auth is a bearer header, not a
+# cookie, so credentials are not enabled.
+_DEFAULT_CORS_ORIGINS = "https://nuvora-ug.netlify.app"
+CORS_ORIGINS = [
+    o.strip().rstrip("/")
+    for o in os.getenv("CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -72,4 +92,5 @@ app.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(tuckshop.router, prefix="/tuckshop", tags=["Tuck Shop"])
 app.include_router(issue.router, prefix="/issue", tags=["Card Issuance"])
+app.include_router(cards.router, prefix="/cards", tags=["Card Orders"])
 app.include_router(diagnostics.router, prefix="/diagnostics", tags=["Diagnostics"])

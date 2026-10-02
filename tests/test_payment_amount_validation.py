@@ -14,36 +14,36 @@ from tests.conftest import make_student_with_wallet
 
 
 # ── POST /payments/ (make_payment) ─────────────────────
-def test_make_payment_rejects_negative_amount(client, db_session, school, parent_user, merchant, auth_headers):
+def test_make_payment_rejects_negative_amount(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/",
         params={"wallet_id": wallet.id, "merchant_id": merchant.id, "amount": -5000},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 400
     db_session.refresh(wallet)
     assert wallet.balance == 10000
 
 
-def test_make_payment_rejects_zero_amount(client, db_session, school, parent_user, merchant, auth_headers):
+def test_make_payment_rejects_zero_amount(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/",
         params={"wallet_id": wallet.id, "merchant_id": merchant.id, "amount": 0},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 400
     db_session.refresh(wallet)
     assert wallet.balance == 10000
 
 
-def test_make_payment_accepts_positive_amount(client, db_session, school, parent_user, merchant, auth_headers):
+def test_make_payment_accepts_positive_amount(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/",
         params={"wallet_id": wallet.id, "merchant_id": merchant.id, "amount": 2000},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
     db_session.refresh(wallet)
@@ -51,13 +51,13 @@ def test_make_payment_accepts_positive_amount(client, db_session, school, parent
 
 
 # ── POST /payments/sync (sync_offline_payments) ────────
-def test_sync_rejects_negative_amount_for_that_item_only(client, db_session, school, parent_user, merchant, auth_headers):
+def test_sync_rejects_negative_amount_for_that_item_only(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=[{"tag_uid": nfc.tag_uid, "amount": -3000, "request_id": str(uuid.uuid4()), "description": "bad"}],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
     body = r.json()
@@ -69,13 +69,13 @@ def test_sync_rejects_negative_amount_for_that_item_only(client, db_session, sch
     assert wallet.balance == 10000
 
 
-def test_sync_rejects_zero_amount_for_that_item_only(client, db_session, school, parent_user, merchant, auth_headers):
+def test_sync_rejects_zero_amount_for_that_item_only(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=[{"tag_uid": nfc.tag_uid, "amount": 0, "request_id": str(uuid.uuid4()), "description": "bad"}],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
     body = r.json()
@@ -86,7 +86,7 @@ def test_sync_rejects_zero_amount_for_that_item_only(client, db_session, school,
     assert wallet.balance == 10000
 
 
-def test_sync_processes_good_items_even_when_batch_has_a_bad_one(client, db_session, school, parent_user, merchant, auth_headers):
+def test_sync_processes_good_items_even_when_batch_has_a_bad_one(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/sync",
@@ -95,7 +95,7 @@ def test_sync_processes_good_items_even_when_batch_has_a_bad_one(client, db_sess
             {"tag_uid": nfc.tag_uid, "amount": -3000, "request_id": str(uuid.uuid4()), "description": "bad"},
             {"tag_uid": nfc.tag_uid, "amount": 1500, "request_id": str(uuid.uuid4()), "description": "good"},
         ],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
     body = r.json()

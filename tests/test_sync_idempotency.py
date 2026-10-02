@@ -21,7 +21,7 @@ from tests.conftest import make_student_with_wallet
 
 
 # ── 1. Resending the exact same batch must not double-charge ──
-def test_resent_batch_does_not_double_charge(client, db_session, school, parent_user, merchant, auth_headers):
+def test_resent_batch_does_not_double_charge(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     request_id = str(uuid.uuid4())
     batch = [{"tag_uid": nfc.tag_uid, "amount": 2000, "request_id": request_id, "description": "Lunch"}]
@@ -30,7 +30,7 @@ def test_resent_batch_does_not_double_charge(client, db_session, school, parent_
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=batch,
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert first.status_code == 200
     assert first.json()["processed"] == 1
@@ -41,7 +41,7 @@ def test_resent_batch_does_not_double_charge(client, db_session, school, parent_
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=batch,
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert second.status_code == 200
     second_body = second.json()
@@ -55,7 +55,7 @@ def test_resent_batch_does_not_double_charge(client, db_session, school, parent_
 
 
 # ── 2. Partial resend: one item already synced, one genuinely new ──
-def test_mixed_batch_only_charges_the_new_item(client, db_session, school, parent_user, merchant, auth_headers):
+def test_mixed_batch_only_charges_the_new_item(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     already_synced_id = str(uuid.uuid4())
 
@@ -63,7 +63,7 @@ def test_mixed_batch_only_charges_the_new_item(client, db_session, school, paren
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=[{"tag_uid": nfc.tag_uid, "amount": 1000, "request_id": already_synced_id}],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert first.json()["processed"] == 1
 
@@ -75,7 +75,7 @@ def test_mixed_batch_only_charges_the_new_item(client, db_session, school, paren
             {"tag_uid": nfc.tag_uid, "amount": 1000, "request_id": already_synced_id},  # resent, already charged
             {"tag_uid": nfc.tag_uid, "amount": 500, "request_id": new_id},              # genuinely new
         ],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert second.status_code == 200
     assert second.json()["processed"] == 2  # both reported processed...
@@ -86,13 +86,13 @@ def test_mixed_batch_only_charges_the_new_item(client, db_session, school, paren
 
 
 # ── 3. A missing request_id can't be synced at all ──
-def test_sync_item_without_request_id_is_rejected(client, db_session, school, parent_user, merchant, auth_headers):
+def test_sync_item_without_request_id_is_rejected(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=[{"tag_uid": nfc.tag_uid, "amount": 1000}],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
     body = r.json()
@@ -105,7 +105,7 @@ def test_sync_item_without_request_id_is_rejected(client, db_session, school, pa
 
 
 # ── 4. /sync now enforces the daily limit, matching /payments/nfc ──
-def test_sync_respects_daily_limit(client, db_session, school, parent_user, merchant, auth_headers):
+def test_sync_respects_daily_limit(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(
         db_session, school, parent_user, balance=50000, daily_limit=5000,
     )
@@ -116,7 +116,7 @@ def test_sync_respects_daily_limit(client, db_session, school, parent_user, merc
             {"tag_uid": nfc.tag_uid, "amount": 4000, "request_id": str(uuid.uuid4())},
             {"tag_uid": nfc.tag_uid, "amount": 2000, "request_id": str(uuid.uuid4())},
         ],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
     body = r.json()
@@ -128,7 +128,7 @@ def test_sync_respects_daily_limit(client, db_session, school, parent_user, merc
     assert wallet.balance == 46000  # only the 4000 item went through
 
 
-def test_sync_daily_limit_ignores_previous_days_spending(client, db_session, school, parent_user, merchant, auth_headers):
+def test_sync_daily_limit_ignores_previous_days_spending(client, db_session, school, parent_user, merchant, staff_headers):
     from datetime import datetime, timedelta
 
     student, wallet, nfc = make_student_with_wallet(
@@ -146,7 +146,7 @@ def test_sync_daily_limit_ignores_previous_days_spending(client, db_session, sch
         "/payments/sync",
         params={"merchant_id": merchant.id, "device_id": "device-1"},
         json=[{"tag_uid": nfc.tag_uid, "amount": 4000, "request_id": str(uuid.uuid4())}],
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
     assert r.json()["processed"] == 1, "today's sync should not be blocked by yesterday's spending"
@@ -157,7 +157,7 @@ def test_sync_daily_limit_ignores_previous_days_spending(client, db_session, sch
 # in test_tuckshop_payment.py: SQLite silently drops FOR UPDATE, so this only
 # proves anything real against Postgres.
 def test_concurrent_resync_same_request_id_does_not_double_charge(
-    client, db_session, school, parent_user, merchant, auth_headers,
+    client, db_session, school, parent_user, merchant, staff_headers,
 ):
     if db_session.bind.dialect.name == "sqlite":
         pytest.skip("FOR UPDATE is a no-op on SQLite; run with TEST_DATABASE_URL set to a Postgres db.")
@@ -171,7 +171,7 @@ def test_concurrent_resync_same_request_id_does_not_double_charge(
             "/payments/sync",
             params={"merchant_id": merchant.id, "device_id": "device-1"},
             json=batch,
-            headers=auth_headers,
+            headers=staff_headers,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:

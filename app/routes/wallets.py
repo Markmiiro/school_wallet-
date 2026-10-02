@@ -1,10 +1,16 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Wallet, Transaction, Student
+from app.models import Wallet, Transaction, Student, User
+from app.auth import get_current_user, assert_school_access
+from app.permissions import assert_wallet_access
 
 router = APIRouter()
+
+# Bounds for a parent- or admin-set daily spending limit, in UGX.
+MIN_DAILY_LIMIT = 500
+MAX_DAILY_LIMIT = 5_000_000
 
 
 # ==========================================
@@ -23,15 +29,19 @@ router = APIRouter()
 # actually /wallets/wallets/{student_id}. This is a known quirk. The
 # Flutter app depends on it — do NOT "fix" the path here without
 # updating the app's ApiConstants at the same time, or the app breaks.
+#
+# Requires a token. A parent sees only their own child; staff see only
+# students of their own school (see assert_wallet_access).
 # ==========================================
 
 @router.get("/wallets/{student_id}")
 def get_wallet(
     student_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
 
-    # STEP 1 → confirm student exists
+    # STEP 1 → confirm student exists, and that the caller may see them
     student = db.query(Student).filter(Student.id == student_id).first()
 
     if not student:
@@ -39,6 +49,8 @@ def get_wallet(
             status_code=404,
             detail="Student not found"
         )
+
+    assert_wallet_access(current_user, student)
 
     # STEP 2 → find wallet
     wallet = db.query(Wallet).filter(
@@ -68,14 +80,24 @@ def get_wallet(
 @router.get("/{student_id}/history")
 def get_transaction_history(
     student_id: int,
-    limit: int = 20,
-    db: Session = Depends(get_db)
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Get all transactions for a student's wallet.
     Shows both top-ups (money IN) and payments (money OUT).
     Ordered newest first.
     """
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No wallet found for student {student_id}"
+        )
+
+    assert_wallet_access(current_user, student)
+
     # Find wallet
     wallet = db.query(Wallet).filter(
         Wallet.student_id == student_id
@@ -109,6 +131,7 @@ def get_transaction_history(
         "student_id": student_id,
         "wallet_id": wallet.id,
         "current_balance": wallet.balance,
+        "is_active": wallet.is_active,
         "daily_limit": wallet.daily_limit,
         "currency": "UGX",
         "summary": {
@@ -131,4 +154,52 @@ def get_transaction_history(
             }
             for t in transactions
         ]
+    }
+
+
+# ================================================
+# PUT /wallets/{student_id}/limit
+# Set the daily spending limit for a child's wallet.
+#
+# Callable by the child's own parent, or by an admin scoped to the
+# child's school (or a super admin). Merchants cannot change limits.
+# The limit itself is enforced at charge time in app/routes/payments.py.
+# ================================================
+@router.put("/{student_id}/limit")
+def set_daily_limit(
+    student_id: int,
+    daily_limit: int = Query(..., ge=MIN_DAILY_LIMIT, le=MAX_DAILY_LIMIT),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Set how much a child may spend per day, in UGX."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    if current_user.role == "admin":
+        assert_school_access(current_user, student.school_id)
+    elif current_user.role == "parent":
+        if student.parent_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not permitted")
+    else:
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    wallet = db.query(Wallet).filter(
+        Wallet.student_id == student_id
+    ).with_for_update().first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    old_limit = wallet.daily_limit
+    wallet.daily_limit = daily_limit
+    db.commit()
+
+    return {
+        "message": "Daily limit updated",
+        "student_id": student_id,
+        "student": student.name,
+        "old_limit": old_limit,
+        "daily_limit": daily_limit,
+        "currency": "UGX",
     }

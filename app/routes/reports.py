@@ -654,6 +654,8 @@ def merchant_daily_report(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
+    assert_school_access(current_user, merchant.school_id)
+
     # ── Parse date ──────────────────────────────
     if report_date:
         try:
@@ -792,6 +794,8 @@ def merchant_dashboard(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
+    assert_school_access(current_user, merchant.school_id)
+
     today      = date.today()
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
@@ -877,6 +881,8 @@ def school_settlement_report(
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    assert_school_access(current_user, school_id)
 
     # ── Parse date ──────────────────────────────
     if report_date:
@@ -1096,9 +1102,17 @@ async def automated_daily_payout(
     Requires secret key for security.
     """
     import os
-    expected_secret = os.getenv("SETTLEMENT_SECRET", "school_wallet_settle_2026")
+    import hmac
+    # No fallback: a default written here is public the moment it is
+    # committed. With SETTLEMENT_SECRET unset, nobody can trigger payouts.
+    expected_secret = os.getenv("SETTLEMENT_SECRET", "")
+    if not expected_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Automated payout is not configured (SETTLEMENT_SECRET is unset)."
+        )
 
-    if secret != expected_secret:
+    if not hmac.compare_digest(secret.encode(), expected_secret.encode()):
         raise HTTPException(
             status_code=403,
             detail="Invalid secret key"

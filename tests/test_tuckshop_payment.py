@@ -20,10 +20,10 @@ from tests.conftest import make_student_with_wallet
 
 
 # ── 1. Happy path ─────────────────────────────────────
-def test_check_then_pay_happy_path(client, db_session, school, parent_user, merchant, auth_headers):
+def test_check_then_pay_happy_path(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
 
-    check = client.get(f"/tuckshop/check?tag_uid={nfc.tag_uid}")
+    check = client.get(f"/tuckshop/check?tag_uid={nfc.tag_uid}", headers=staff_headers)
     assert check.status_code == 200
     body = check.json()
     assert body["student_name"] == "Test Student"
@@ -32,7 +32,7 @@ def test_check_then_pay_happy_path(client, db_session, school, parent_user, merc
     pay = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 2000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert pay.status_code == 200
     data = pay.json()
@@ -50,29 +50,29 @@ def test_check_then_pay_happy_path(client, db_session, school, parent_user, merc
 
 
 # ── 2. Unknown tag ─────────────────────────────────────
-def test_check_unknown_tag_returns_404(client):
-    r = client.get("/tuckshop/check?tag_uid=DOESNOTEXIST")
+def test_check_unknown_tag_returns_404(client, staff_headers):
+    r = client.get("/tuckshop/check?tag_uid=DOESNOTEXIST", headers=staff_headers)
     assert r.status_code == 404
 
 
-def test_pay_unknown_tag_returns_404(client, merchant, auth_headers):
+def test_pay_unknown_tag_returns_404(client, merchant, staff_headers):
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": "DOESNOTEXIST", "merchant_id": merchant.id, "amount": 1000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 404
 
 
 # ── 3. Deactivated wallet ──────────────────────────────
-def test_pay_deactivated_wallet_returns_403(client, db_session, school, parent_user, merchant, auth_headers):
+def test_pay_deactivated_wallet_returns_403(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(
         db_session, school, parent_user, balance=10000, wallet_active=False,
     )
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 1000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 403
     db_session.refresh(wallet)
@@ -80,12 +80,12 @@ def test_pay_deactivated_wallet_returns_403(client, db_session, school, parent_u
 
 
 # ── 4. Unknown merchant ────────────────────────────────
-def test_pay_unknown_merchant_returns_404(client, db_session, school, parent_user, auth_headers):
+def test_pay_unknown_merchant_returns_404(client, db_session, school, parent_user, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": 999999, "amount": 1000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 404
     db_session.refresh(wallet)
@@ -93,12 +93,12 @@ def test_pay_unknown_merchant_returns_404(client, db_session, school, parent_use
 
 
 # ── 5. Insufficient balance ────────────────────────────
-def test_pay_insufficient_balance_returns_400(client, db_session, school, parent_user, merchant, auth_headers):
+def test_pay_insufficient_balance_returns_400(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=500)
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 1000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 400
     db_session.refresh(wallet)
@@ -107,33 +107,33 @@ def test_pay_insufficient_balance_returns_400(client, db_session, school, parent
 
 
 # ── 6. Daily limit ──────────────────────────────────────
-def test_pay_within_daily_limit_succeeds(client, db_session, school, parent_user, merchant, auth_headers):
+def test_pay_within_daily_limit_succeeds(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(
         db_session, school, parent_user, balance=50000, daily_limit=5000,
     )
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 5000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200
 
 
-def test_pay_exceeding_daily_limit_returns_400(client, db_session, school, parent_user, merchant, auth_headers):
+def test_pay_exceeding_daily_limit_returns_400(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(
         db_session, school, parent_user, balance=50000, daily_limit=5000,
     )
     first = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 4000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert first.status_code == 200
 
     second = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 2000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert second.status_code == 400
     assert "Daily limit" in second.json()["detail"]
@@ -142,7 +142,7 @@ def test_pay_exceeding_daily_limit_returns_400(client, db_session, school, paren
     assert wallet.balance == 46000  # only the first payment went through
 
 
-def test_daily_limit_ignores_previous_days_spending(client, db_session, school, parent_user, merchant, auth_headers):
+def test_daily_limit_ignores_previous_days_spending(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(
         db_session, school, parent_user, balance=50000, daily_limit=5000,
     )
@@ -160,7 +160,7 @@ def test_daily_limit_ignores_previous_days_spending(client, db_session, school, 
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 4000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 200, "today's spend should not be blocked by yesterday's transactions"
 
@@ -171,15 +171,15 @@ def test_daily_limit_ignores_previous_days_spending(client, db_session, school, 
 # with the same request_id doesn't re-check balance/daily-limit or
 # touch the wallet at all — it returns the original result (see
 # _idempotent_replay_response in app/routes/payments.py).
-def test_identical_retry_does_not_double_charge(client, db_session, school, parent_user, merchant, auth_headers):
+def test_identical_retry_does_not_double_charge(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     params = {
         "tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 3000,
         "request_id": str(uuid.uuid4()),
     }
 
-    first = client.post("/payments/nfc", params=params, headers=auth_headers)
-    second = client.post("/payments/nfc", params=params, headers=auth_headers)
+    first = client.post("/payments/nfc", params=params, headers=staff_headers)
+    second = client.post("/payments/nfc", params=params, headers=staff_headers)
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -193,19 +193,19 @@ def test_identical_retry_does_not_double_charge(client, db_session, school, pare
     assert db_session.query(models.Payment).filter_by(wallet_id=wallet.id).count() == 1
 
 
-def test_different_request_ids_are_independent_charges(client, db_session, school, parent_user, merchant, auth_headers):
+def test_different_request_ids_are_independent_charges(client, db_session, school, parent_user, merchant, staff_headers):
     """Two genuinely separate purchases of the same amount must both go through."""
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
 
     first = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 1000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     second = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 1000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
 
     assert first.status_code == 200
@@ -217,12 +217,12 @@ def test_different_request_ids_are_independent_charges(client, db_session, schoo
     assert db_session.query(models.Transaction).filter_by(wallet_id=wallet.id).count() == 2
 
 
-def test_missing_request_id_is_rejected(client, db_session, school, parent_user, merchant, auth_headers):
+def test_missing_request_id_is_rejected(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 1000},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 422
     db_session.refresh(wallet)
@@ -247,7 +247,7 @@ def test_missing_request_id_is_rejected(client, db_session, school, parent_user,
 #     ./venv/bin/python -m pytest tests/test_tuckshop_payment.py -k concurrent
 # See also test_wallet_balance_reads_request_row_locking, a
 # dialect-independent regression check that runs on every backend.
-def test_concurrent_payments_do_not_overdraw_wallet(client, db_session, school, parent_user, merchant, auth_headers):
+def test_concurrent_payments_do_not_overdraw_wallet(client, db_session, school, parent_user, merchant, staff_headers):
     if db_session.bind.dialect.name == "sqlite":
         pytest.skip("FOR UPDATE is a no-op on SQLite; run with TEST_DATABASE_URL set to a Postgres db.")
 
@@ -261,7 +261,7 @@ def test_concurrent_payments_do_not_overdraw_wallet(client, db_session, school, 
             "tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 2000,
             "request_id": str(uuid.uuid4()),
         }
-        return client.post("/payments/nfc", params=params, headers=auth_headers)
+        return client.post("/payments/nfc", params=params, headers=staff_headers)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: fire(), range(2)))
@@ -320,24 +320,24 @@ def test_wallet_balance_reads_request_row_locking():
 # check (balance < amount is False for any negative amount) and then
 # `wallet.balance -= amount` increased the balance — free money with
 # no real charge from Yo Uganda behind it.
-def test_negative_amount_is_rejected(client, db_session, school, parent_user, merchant, auth_headers):
+def test_negative_amount_is_rejected(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": -5000, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     db_session.refresh(wallet)
     assert r.status_code == 400
     assert wallet.balance == 10000
 
 
-def test_zero_amount_is_rejected(client, db_session, school, parent_user, merchant, auth_headers):
+def test_zero_amount_is_rejected(client, db_session, school, parent_user, merchant, staff_headers):
     student, wallet, nfc = make_student_with_wallet(db_session, school, parent_user, balance=10000)
     r = client.post(
         "/payments/nfc",
         params={"tag_uid": nfc.tag_uid, "merchant_id": merchant.id, "amount": 0, "request_id": str(uuid.uuid4())},
-        headers=auth_headers,
+        headers=staff_headers,
     )
     assert r.status_code == 400
     db_session.refresh(wallet)

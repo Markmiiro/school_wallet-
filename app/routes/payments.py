@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from datetime import datetime, date
+from datetime import datetime, timedelta
 
 from app.database import get_db
 from app.models import Wallet, Merchant, Transaction, Payment
@@ -9,9 +10,58 @@ from app.sms import sms_payment_alert, sms_low_balance_alert
 from app.models import Student, User
 from app.auth import get_current_user
 from app.models import User
+from app.permissions import assert_staff, assert_till_staff
 
 router = APIRouter()
 
+
+# ────────────────────────────────────────────────
+# WHO MAY CHARGE A WALLET
+#
+# Every charge endpoint below used to accept any valid token, including
+# a self-registered parent's, and took wallet_id / merchant_id straight
+# from the request. Now:
+#   - the caller must be school staff (admin or merchant);
+#   - the merchant being credited must belong to the caller's school;
+#   - the wallet being debited must belong to a student of that same
+#     school.
+# ────────────────────────────────────────────────
+def _assert_wallet_at_merchant_school(db: Session, wallet: Wallet, merchant: Merchant) -> None:
+    student = db.query(Student).filter(Student.id == wallet.student_id).first()
+    if not student or student.school_id != merchant.school_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This card belongs to a student at a different school.",
+        )
+
+
+# ────────────────────────────────────────────────
+# DAILY LIMIT WINDOW
+#
+# Transaction.timestamp is stored in UTC. The daily limit is meant as a
+# Kampala calendar day (UTC+3, no daylight saving), so the window runs
+# from Kampala midnight, expressed in UTC. Summed in the database rather
+# than by loading every payment the wallet has ever made.
+# ────────────────────────────────────────────────
+KAMPALA_UTC_OFFSET = timedelta(hours=3)
+
+
+def _spent_today(db: Session, wallet_id: int) -> int:
+    local_now = datetime.utcnow() + KAMPALA_UTC_OFFSET
+    day_start_utc = (
+        datetime.combine(local_now.date(), datetime.min.time()) - KAMPALA_UTC_OFFSET
+    )
+    total = (
+        db.query(func.coalesce(func.sum(Transaction.amount), 0))
+        .filter(
+            Transaction.wallet_id == wallet_id,
+            Transaction.type == "payment",
+            Transaction.status == "completed",
+            Transaction.timestamp >= day_start_utc,
+        )
+        .scalar()
+    )
+    return int(total or 0)
 
 
 
@@ -41,6 +91,7 @@ def make_payment(
     3. Balance must cover the amount
     4. Amount must not exceed daily limit
     """
+    assert_staff(current_user)
 
     # ── CHECK 0: Amount is positive ─────────────
     if amount <= 0:
@@ -69,6 +120,9 @@ def make_payment(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
+    assert_till_staff(current_user, merchant.school_id)
+    _assert_wallet_at_merchant_school(db, wallet, merchant)
+
     # ── CHECK 4: Enough balance ─────────────────
     if wallet.balance < amount:
         raise HTTPException(
@@ -80,22 +134,7 @@ def make_payment(
 
     # ── CHECK 5: Daily limit ────────────────────
     # Check how much has been spent today already
-    today = date.today()
-    spent_today = (
-        db.query(Transaction)
-        .filter(
-            Transaction.wallet_id == wallet_id,
-            Transaction.type == "payment",
-            Transaction.status == "completed",
-        )
-        .all()
-    )
-
-    # Add up today's spending only
-    total_spent_today = sum(
-        t.amount for t in spent_today
-        if t.timestamp and t.timestamp.date() == today
-    )
+    total_spent_today = _spent_today(db, wallet_id)
 
     # Check if this payment would exceed the daily limit
     if wallet.daily_limit and (total_spent_today + amount) > wallet.daily_limit:
@@ -209,6 +248,8 @@ def get_merchant_payments(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
+    assert_till_staff(current_user, merchant.school_id)
+
     payments = (
         db.query(Transaction)
         .filter(
@@ -298,6 +339,8 @@ def nfc_payment(
     """
     from app.models import NFCTag
 
+    assert_staff(current_user)
+
     # ── CHECK 0: Amount is positive ─────────────
     if amount <= 0:
         raise HTTPException(
@@ -355,6 +398,9 @@ def nfc_payment(
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
 
+    assert_till_staff(current_user, merchant.school_id)
+    _assert_wallet_at_merchant_school(db, wallet, merchant)
+
     # ── CHECK BALANCE ────────────────────────────
     if wallet.balance < amount:
         raise HTTPException(
@@ -365,20 +411,7 @@ def nfc_payment(
         )
 
     # ── CHECK DAILY LIMIT ────────────────────────
-    today = date.today()
-    spent_today = (
-        db.query(Transaction)
-        .filter(
-            Transaction.wallet_id == wallet.id,
-            Transaction.type == "payment",
-            Transaction.status == "completed",
-        )
-        .all()
-    )
-    total_spent_today = sum(
-        t.amount for t in spent_today
-        if t.timestamp and t.timestamp.date() == today
-    )
+    total_spent_today = _spent_today(db, wallet.id)
 
     if wallet.daily_limit and (total_spent_today + amount) > wallet.daily_limit:
         remaining = wallet.daily_limit - total_spent_today
@@ -513,6 +546,17 @@ def sync_offline_payments(
     """
     from app.models import NFCTag
 
+    assert_staff(current_user)
+
+    # merchant_id used to be written onto every synced Transaction without
+    # ever being looked up — so sales could be credited to any merchant,
+    # or to one that does not exist.
+    merchant = db.query(Merchant).filter(Merchant.id == merchant_id).first()
+    if not merchant:
+        raise HTTPException(status_code=404, detail="Merchant not found")
+    assert_till_staff(current_user, merchant.school_id)
+    merchant_school_id = merchant.school_id
+
     processed = []
     failed = []
 
@@ -536,13 +580,15 @@ def sync_offline_payments(
                 })
                 continue
 
-            # Amount must be positive
-            if not isinstance(amount, (int, float)) or amount <= 0:
+            # Amount must be a positive whole number of UGX. bool is a
+            # subclass of int in Python, so it is excluded explicitly; a
+            # float would be silently truncated by the Integer column.
+            if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
                 failed.append({
                     "tag_uid": tag_uid,
                     "amount": amount,
                     "request_id": request_id,
-                    "reason": "Amount must be greater than zero"
+                    "reason": "Amount must be a whole number greater than zero"
                 })
                 continue
 
@@ -586,6 +632,18 @@ def sync_offline_payments(
                 })
                 continue
 
+            card_student = db.query(Student).filter(
+                Student.id == wallet.student_id
+            ).first()
+            if not card_student or card_student.school_id != merchant_school_id:
+                failed.append({
+                    "tag_uid": tag_uid,
+                    "amount": amount,
+                    "request_id": request_id,
+                    "reason": "Card belongs to a student at a different school"
+                })
+                continue
+
             # ── IDEMPOTENCY CHECK ────────────────────
             # Runs AFTER the wallet row lock above, for the same reason as
             # /payments/nfc: a genuine concurrent resync of this exact
@@ -618,20 +676,7 @@ def sync_offline_payments(
             # "Today" here is sync time, not the original offline tap time
             # (the Transaction rows it's compared against are timestamped
             # at sync/commit time too, same as the rest of this endpoint).
-            today = date.today()
-            spent_today = (
-                db.query(Transaction)
-                .filter(
-                    Transaction.wallet_id == wallet.id,
-                    Transaction.type == "payment",
-                    Transaction.status == "completed",
-                )
-                .all()
-            )
-            total_spent_today = sum(
-                t.amount for t in spent_today
-                if t.timestamp and t.timestamp.date() == today
-            )
+            total_spent_today = _spent_today(db, wallet.id)
             if wallet.daily_limit and (total_spent_today + amount) > wallet.daily_limit:
                 remaining = wallet.daily_limit - total_spent_today
                 failed.append({
@@ -745,11 +790,15 @@ def sync_offline_payments(
 # Check last sync status for a device
 # ================================================
 @router.get("/sync/status/{device_id}")
-def get_sync_status(device_id: str):
+def get_sync_status(
+    device_id: str,
+    current_user: User = Depends(get_current_user),
+):
     """
     Returns the last sync status for a tuck shop device.
     Useful for the admin to see when each device last synced.
     """
+    assert_staff(current_user)
     return {
         "device_id": device_id,
         "message": "Sync status endpoint ready",

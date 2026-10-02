@@ -91,6 +91,7 @@ def _build_test_app():
     from app.routes import (
         payments, tuckshop, merchants, webhook, auth as auth_routes,
         students, topup, schools, users, reports, diagnostics,
+        wallets, analytics, cards,
     )
 
     app = FastAPI()
@@ -105,6 +106,9 @@ def _build_test_app():
     app.include_router(users.router, prefix="/users", tags=["Users"])
     app.include_router(reports.router, prefix="/reports", tags=["Reports & Settlement"])
     app.include_router(diagnostics.router, prefix="/diagnostics", tags=["Diagnostics"])
+    app.include_router(wallets.router, prefix="/wallets", tags=["Wallets"])
+    app.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
+    app.include_router(cards.router, prefix="/cards", tags=["Card Orders"])
     return app
 
 
@@ -220,6 +224,30 @@ def auth_headers(parent_user):
         user_id=parent_user.id, role=parent_user.role, phone=parent_user.phone,
     )
     return {"Authorization": f"Bearer {token}"}
+
+
+def make_merchant_user(db_session, school, *, phone):
+    """A tuck-shop staff login (role="merchant") attached to `school`."""
+    u = models.User(
+        name="Test Till Staff", phone=phone, role="merchant",
+        pin_hash=hash_pin("1234"), school_id=school.id,
+    )
+    db_session.add(u)
+    db_session.commit()
+    db_session.refresh(u)
+    return u
+
+
+@pytest.fixture()
+def staff_user(db_session, school):
+    return make_merchant_user(db_session, school, phone="256700999003")
+
+
+# The token a till uses. Charge endpoints refuse a parent token, so the
+# payment tests authenticate with this rather than auth_headers.
+@pytest.fixture()
+def staff_headers(staff_user):
+    return headers_for(staff_user)
 
 
 def make_admin(db_session, school, *, phone):

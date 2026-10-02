@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime, date, timedelta
 from typing import Optional
 import io
-from app.auth import get_current_user, get_current_admin
+from app.auth import get_current_user, get_current_admin, assert_school_access
 from app.models import User
 from app.database import get_db
 from app.models import (
@@ -91,6 +91,9 @@ def school_overview(
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    # A school admin may only read their own school's figures.
+    assert_school_access(current_user, school_id)
 
     today       = date.today()
     week_start  = today - timedelta(days=today.weekday())
@@ -211,6 +214,9 @@ def school_daily_breakdown(
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
 
+    # A school admin may only read their own school's figures.
+    assert_school_access(current_user, school_id)
+
     if report_date:
         try:
             target_date = datetime.strptime(report_date, "%Y-%m-%d").date()
@@ -272,6 +278,9 @@ def school_weekly_trends(
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    # A school admin may only read their own school's figures.
+    assert_school_access(current_user, school_id)
 
     today      = date.today()
     week_start = today - timedelta(days=6)  # last 7 days
@@ -341,6 +350,8 @@ def student_spending_summary(
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+
+    assert_school_access(current_user, student.school_id)
 
     wallet = db.query(Wallet).filter(
         Wallet.student_id == student_id
@@ -443,6 +454,9 @@ def export_to_excel(
     school = db.query(School).filter(School.id == school_id).first()
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
+
+    # A school admin may only read their own school's figures.
+    assert_school_access(current_user, school_id)
 
     if report_date:
         try:
