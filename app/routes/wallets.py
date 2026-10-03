@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -121,15 +122,20 @@ def get_transaction_history(
         .all()
     )
 
-    # Calculate totals
-    total_in = sum(
-        t.amount for t in transactions
-        if t.type == "topup" and t.status == "completed"
-    )
-    total_out = sum(
-        t.amount for t in transactions
-        if t.type == "payment" and t.status == "completed"
-    )
+    # Totals over the whole wallet, not only the page returned: the app
+    # shows them as "Topped up" and "Spent".
+    def _total(kind: str) -> int:
+        return db.query(func.coalesce(func.sum(Transaction.amount), 0)).filter(
+            Transaction.wallet_id == wallet.id,
+            Transaction.type == kind,
+            Transaction.status == "completed",
+        ).scalar()
+
+    total_in = _total("topup")
+    total_out = _total("payment")
+    count = db.query(func.count(Transaction.id)).filter(
+        Transaction.wallet_id == wallet.id
+    ).scalar()
 
     return {
         "student_id": student_id,
@@ -141,7 +147,7 @@ def get_transaction_history(
         "summary": {
             "total_topped_up": total_in,
             "total_spent": total_out,
-            "number_of_transactions": len(transactions),
+            "number_of_transactions": count,
         },
         "transactions": [
             {
@@ -154,6 +160,9 @@ def get_transaction_history(
                 "status": t.status,
                 "reference": t.reference,
                 "description": t.description,
+                # The tuck shop, for a purchase. The till sends the same
+                # description for every sale, so the name comes from here.
+                "merchant": t.merchant.name if t.merchant else None,
                 "date": t.timestamp,
             }
             for t in transactions
