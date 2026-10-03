@@ -179,7 +179,7 @@ DOCUMENTS = [
                  f"{_OPERATOR} is responsible for the personal data described "
                  f"here, under Uganda's Data Protection and Privacy Act, 2019. "
                  f"For any privacy question or request, contact {_CONTACT}. "
-                 "Our address: " + _ask("physical or postal address in Uganda") + " "
+                 "Our address: Kireka, along Kireka-Namugongo Road, Uganda. "
                  + _ask("PDPO registration number"))},
             {"heading": "2. What we collect and why",
              "body": (
