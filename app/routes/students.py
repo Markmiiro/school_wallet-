@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Student, Wallet, NFCTag, School, User, CardOrder
+from app.models import Student, Wallet, NFCTag, School, User, CardOrder, Transaction
 from app.account_number import generate_account_number
 from app.auth import (
     get_current_user,
@@ -15,7 +15,7 @@ from app.auth import (
     assert_school_access,
     visible_school_id,
 )
-from app.permissions import clean_name
+from app.permissions import clean_name, clean_local_phone
 
 router = APIRouter()
 
@@ -26,7 +26,7 @@ router = APIRouter()
 # card status so the mobile app can display them
 # without extra round trips.
 # ────────────────────────────────────────────────
-def student_payload(student: Student) -> dict:
+def student_payload(student: Student, *, for_school: bool = False) -> dict:
     nfc = student.active_nfc_tag
 
     if nfc is not None:
@@ -45,7 +45,7 @@ def student_payload(student: Student) -> dict:
         nfc_status = "no card slot"
         tag_uid = None
 
-    return {
+    payload = {
         "id": student.id,
         "name": student.name,
         "school_id": student.school_id,
@@ -57,6 +57,10 @@ def student_payload(student: Student) -> dict:
             "status": nfc_status,
         },
     }
+    # The roster contact is for the school office, not the till.
+    if for_school:
+        payload["guardian_phone"] = student.guardian_phone
+    return payload
 
 
 # ────────────────────────────────────────────────
@@ -111,13 +115,18 @@ def normalize_uid(raw: str) -> str:
 def create_student(
     name: str,
     school_id: int,
-    parent_id: int,
+    parent_id: Optional[int] = None,
+    guardian_phone: Optional[str] = None,
     db: Session = Depends(get_db),
     current_admin: User = Depends(get_current_admin),
 ):
     """Register a new student. Automatically creates their wallet,
     an empty NFC tag slot (filled in later via /assign-nfc), and a
-    parent-facing account number."""
+    parent-facing account number.
+
+    A roster entry usually has no parent yet, only guardian_phone: the
+    parent gets the child by verifying that number (app/routes/family.py).
+    """
 
     # A scoped admin can only create students in their own school
     assert_school_access(current_admin, school_id)
@@ -130,15 +139,19 @@ def create_student(
         raise HTTPException(status_code=404, detail=f"School {school_id} not found")
 
     # Check parent exists
-    parent = db.query(User).filter(User.id == parent_id).first()
-    if not parent:
-        raise HTTPException(status_code=404, detail=f"Parent {parent_id} not found")
+    if parent_id is not None:
+        parent = db.query(User).filter(User.id == parent_id).first()
+        if not parent:
+            raise HTTPException(status_code=404, detail=f"Parent {parent_id} not found")
+
+    phone = clean_local_phone(guardian_phone) if guardian_phone else None
 
     # Create student
     student = Student(
         name=name,
         school_id=school_id,
-        parent_id=parent_id
+        parent_id=parent_id,
+        guardian_phone=phone,
     )
     db.add(student)
     db.flush()  # get student.id before committing
@@ -173,6 +186,7 @@ def create_student(
             "school_id": student.school_id,
             "school_name": school.name,
             "parent_id": student.parent_id,
+            "guardian_phone": student.guardian_phone,
             "account_number": student.account_number,
         },
         "wallet": {
@@ -215,7 +229,8 @@ def get_all_students(
     else:
         raise HTTPException(status_code=403, detail="Not permitted")
 
-    return [student_payload(s) for s in q.all()]
+    for_school = current_user.role == "admin"
+    return [student_payload(s, for_school=for_school) for s in q.all()]
 
 
 # ================================================
@@ -312,13 +327,13 @@ def get_students_by_parent(
 # tapping (the school's /issue/ page) or typed in by hand (the parent
 # app, and the /issue/ page's manual entry).
 #
-# Callable by:
-#   - an admin scoped to the student's school (or a super admin) —
-#     may link a first card, or REPLACE a working one;
-#   - the student's own parent — may link a card only when the child
-#     has no working card (never issued, or reported lost/stolen).
-#     Swapping out a card that still works stays a school action, so a
-#     mistyped number in the app can never silently retire a good card.
+# Callable by an admin scoped to the student's school (or a super
+# admin) — may link a first card, or REPLACE a working one.
+#
+# Parents may not (decision 3 Oct 2026). A card number is printed on the
+# card and readable by any NFC phone, so it proves nothing about who is
+# asking; anyone who handled a card could have linked it. The school
+# links each card from its roster at handout.
 #
 # Nobody creates students here. The student must already exist.
 # ================================================
@@ -343,17 +358,11 @@ def assign_nfc_tag(
         # Note the school comes from the STUDENT, never from the request.
         assert_school_access(current_user, student.school_id)
     elif current_user.role == "parent":
-        if student.parent_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not permitted")
-        working = student.active_nfc_tag
-        if working is not None and working.tag_uid is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"{student.name} already has a working card. Report it "
-                    f"lost or stolen first, or ask the school to replace it."
-                ),
-            )
+        raise HTTPException(
+            status_code=403,
+            detail="Cards are linked by the school. Ask the school office "
+                   "to link your child's card.",
+        )
     else:
         raise HTTPException(status_code=403, detail="Not permitted")
 
@@ -374,27 +383,31 @@ def assign_nfc_tag(
         )
 
     active = student.active_nfc_tag
+    now = datetime.utcnow()
 
     if active is None:
         # No usable card right now — either this student has no nfc_tags
         # row at all (shouldn't happen post-registration, but be safe),
         # or their last card was reported stolen/lost. Either way, a
         # brand new row for the new physical card.
-        nfc = NFCTag(student_id=student_id, tag_uid=uid, is_active=True, status="active")
+        nfc = NFCTag(student_id=student_id, tag_uid=uid, is_active=True,
+                     status="active", linked_at=now)
         db.add(nfc)
     elif active.tag_uid is None:
         # Empty placeholder from registration — never represented a real
         # physical card, so fill it in place rather than spawning history.
         active.tag_uid = uid
         active.status = "active"
+        active.linked_at = now
     else:
         # Swapping a working card for a new one (not a theft/loss report —
         # see POST /students/{id}/report-stolen for that). Retire the old
         # row and start a fresh one so the old tag_uid stays on record.
         active.is_active = False
         active.status = "replaced"
-        active.deactivated_at = datetime.utcnow()
-        nfc = NFCTag(student_id=student_id, tag_uid=uid, is_active=True, status="active")
+        active.deactivated_at = now
+        nfc = NFCTag(student_id=student_id, tag_uid=uid, is_active=True,
+                     status="active", linked_at=now)
         db.add(nfc)
 
     # A card bought in the app (app/routes/cards.py) has now been handed
@@ -403,7 +416,7 @@ def assign_nfc_tag(
     db.query(CardOrder).filter(
         CardOrder.student_id == student_id, CardOrder.status == "paid",
     ).update(
-        {"status": "fulfilled", "fulfilled_at": datetime.utcnow()},
+        {"status": "fulfilled", "fulfilled_at": now},
         synchronize_session=False,
     )
 
@@ -422,6 +435,93 @@ def assign_nfc_tag(
 # PUT /students/{student_id}/deactivate
 # Deactivate a student who left the school
 # ================================================
+# ================================================
+# POST /students/{student_id}/undo-card-link
+# Free a card the school linked to the wrong child, so it can go to the
+# right one. Only while nothing has been bought since the link: after
+# that the card has spent someone's money and must be reported or
+# replaced instead, which keeps its number on record for good.
+# ================================================
+@router.post("/{student_id}/undo-card-link")
+def undo_card_link(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not permitted")
+    assert_school_access(current_user, student.school_id)
+
+    card = student.active_nfc_tag
+    if card is None or card.tag_uid is None:
+        raise HTTPException(status_code=404, detail="This child has no linked card.")
+    if card.linked_at is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This card was linked before undo was possible. Report it "
+                   "lost or replace it instead.",
+        )
+
+    wallet = student.wallet
+    spent = wallet is not None and db.query(Transaction).filter(
+        Transaction.wallet_id == wallet.id,
+        Transaction.type == "payment",
+        Transaction.status == "completed",
+        Transaction.timestamp >= card.linked_at,
+    ).first() is not None
+    if spent:
+        raise HTTPException(
+            status_code=409,
+            detail="Something has been bought with this card since it was "
+                   "linked. Report it lost or replace it instead.",
+        )
+
+    uid, linked_at = card.tag_uid, card.linked_at
+    # Back to the empty slot registration makes; no row keeps the number,
+    # so it can be linked again.
+    card.tag_uid = None
+    card.linked_at = None
+    card.status = "active"
+
+    # A card order this link closed is owed again.
+    db.query(CardOrder).filter(
+        CardOrder.student_id == student_id,
+        CardOrder.status == "fulfilled",
+        CardOrder.fulfilled_at >= linked_at,
+    ).update({"status": "paid", "fulfilled_at": None}, synchronize_session=False)
+
+    db.commit()
+    return {"message": f"Card {uid} unlinked from {student.name}.", "tag_uid": uid}
+
+
+# ================================================
+# PUT /students/{student_id}/guardian-phone?phone=
+# Set or correct the roster's guardian phone. An empty phone clears it.
+# Does not move a child already on a parent's account: that stays a
+# deliberate school decision.
+# ================================================
+@router.put("/{student_id}/guardian-phone")
+def set_guardian_phone(
+    student_id: int,
+    phone: str = "",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not permitted")
+    assert_school_access(current_user, student.school_id)
+
+    student.guardian_phone = clean_local_phone(phone) if phone.strip() else None
+    db.commit()
+    return {"student_id": student.id, "guardian_phone": student.guardian_phone}
+
+
 @router.put("/{student_id}/deactivate")
 def deactivate_student(
     student_id: int,

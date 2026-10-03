@@ -89,6 +89,19 @@ def clean_phone(raw: Optional[str]) -> str:
     return cleaned
 
 
+def clean_local_phone(raw: Optional[str]) -> str:
+    """
+    clean_phone(), also accepting the local forms a school types into a
+    roster: 0700 111 222, 700111222, +256 700 111 222.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("0") and len(digits) == 10:
+        digits = "256" + digits[1:]
+    elif len(digits) == 9:
+        digits = "256" + digits
+    return clean_phone(digits)
+
+
 def clean_name(raw: Optional[str], *, what: str = "Name") -> str:
     """Trim, and require 1–100 characters, or raise 422."""
     cleaned = (raw or "").strip()

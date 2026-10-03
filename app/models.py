@@ -88,6 +88,11 @@ class Student(Base):
     account_number = Column(String, unique=True, nullable=True, index=True)
     dob            = Column(String, nullable=True)   # free text, e.g. "2015-01-12"
     class_name     = Column(String, nullable=True)   # e.g. "P4", "S2"
+    # From the school's roster: the guardian's phone, 256XXXXXXXXX. A
+    # parent whose verified account phone matches gets this child (see
+    # app/routes/family.py). Not the same as parent_id: the roster can
+    # name a guardian who has not signed up yet.
+    guardian_phone = Column(String, nullable=True, index=True)
 
     # Relationships
     school   = relationship("School", back_populates="students")
@@ -205,6 +210,10 @@ class NFCTag(Base):
     status         = Column(String, nullable=False, default="active")
     deactivated_at = Column(DateTime, nullable=True)
     card_color     = Column(String, nullable=True)   # Blue | Green | Yellow | Red
+    # When tag_uid was filled in. A link with no purchase since can be
+    # undone without retiring the card (POST /students/{id}/undo-card-link).
+    # NULL for links made before this existed: those cannot be undone.
+    linked_at      = Column(DateTime, nullable=True)
     student_id     = Column(Integer, ForeignKey("students.id"), nullable=False)
 
     # Relationships
@@ -393,3 +402,27 @@ class AccountClosure(Base):
     refunded_at   = Column(DateTime, nullable=True)
     completed_at  = Column(DateTime, nullable=True)
     cancelled_at  = Column(DateTime, nullable=True)
+
+
+# ════════════════════════════════════════════════
+# PHONE VERIFICATIONS
+# Proof that a parent holds their account phone, by a 6-digit SMS code.
+# Needed before roster children are attached by phone number: signup
+# does not verify the number, so without this anyone could register a
+# guardian's number first and receive that family's children.
+#
+# One row per code sent. verified_at set on the row that was confirmed;
+# a user with any verified row for their current phone is verified.
+# The code itself is never stored, only an HMAC of it.
+# ════════════════════════════════════════════════
+class PhoneVerification(Base):
+    __tablename__ = "phone_verifications"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    phone       = Column(String, nullable=False)
+    code_hash   = Column(String, nullable=False)
+    attempts    = Column(Integer, nullable=False, default=0)
+    sent_at     = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at  = Column(DateTime, nullable=False)
+    verified_at = Column(DateTime, nullable=True)

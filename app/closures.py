@@ -25,7 +25,7 @@
 #   users            name → "Deleted user", PIN removed; row kept (card
 #                    orders point at it); terms acceptance kept as proof
 #   students         name → "Closed account · {account number}", date of
-#                    birth and class emptied; school and account number
+#                    birth, class and roster guardian phone emptied; school and account number
 #                    kept so the school's reports still add up
 #   transactions,
 #   card_orders      payer phone emptied (Yo can trace by reference)
@@ -282,6 +282,7 @@ def _anonymise(db: Session, closure: AccountClosure) -> None:
         s.name = "Closed account" + (f" · {s.account_number}" if s.account_number else "")
         s.dob = None
         s.class_name = None
+        s.guardian_phone = None
 
     if student_ids:
         wallet_ids = [w.id for w in db.query(Wallet)

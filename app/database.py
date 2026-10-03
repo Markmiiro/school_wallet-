@@ -95,6 +95,11 @@ def create_tables():
     # Lives on the card record, not the student.
     add_column_if_missing("nfc_tags",     "card_color",  "VARCHAR")
 
+    # Family linking (3 Oct 2026): the roster's guardian phone, and when a
+    # card was linked (so a fresh mistake can be undone). Both nullable.
+    add_column_if_missing("students",     "guardian_phone", "VARCHAR")
+    add_column_if_missing("nfc_tags",     "linked_at",      "TIMESTAMP")
+
     # Lost/stolen-card support: NFCTag went from one-to-one with Student
     # to one-to-many (see app/models.py). status/deactivated_at record
     # why and when a given physical card stopped being usable.

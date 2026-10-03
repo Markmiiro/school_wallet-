@@ -17,6 +17,10 @@ Endpoints used (all already exist):
     GET  /schools/                    -> school filter
     GET  /cards/orders/owed           -> cards parents have paid for in the app
     PUT  /students/{id}/assign-nfc    -> bind a card
+    POST /students/{id}/undo-card-link -> free a card linked to the wrong
+                                         child, if nothing was bought since
+    PUT  /students/{id}/guardian-phone -> the roster's guardian phone; a
+                                         parent on that number gets the child
 
 SECURITY NOTE: the role check in this page is cosmetic. Hiding a button does not
 protect an endpoint. assign-nfc still needs
@@ -116,6 +120,10 @@ PAGE = r"""
          background:#00d4aa;color:#06231c;padding:10px 18px;border-radius:99px;
          font-size:14px;font-weight:600;opacity:0;transition:opacity .2s;z-index:40}
   .toast.show{opacity:1}
+  .acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+  .mini{font-size:12px;padding:4px 9px;border-radius:99px;background:#262b36;
+        color:#c9ced6;cursor:pointer}
+  .mini.none{color:#ffcf7a}
 </style>
 </head>
 <body>
@@ -360,6 +368,12 @@ function render(){
           <div class="acct" onclick="copyAcct(event,'${esc(s.account_number||'')}')">
             ${esc(s.account_number || 'no account number')}</div>
           <div class="sub">${esc(s.school_name || '-')}${uid ? ' · ' + esc(uid) : ''}</div>
+          <div class="acts">
+            <span class="mini ${s.guardian_phone ? '' : 'none'}"
+                  onclick="editPhone(event,${s.id})">${s.guardian_phone
+                    ? 'Guardian ' + esc(s.guardian_phone) : 'Add guardian phone'}</span>
+            ${uid ? `<span class="mini" onclick="undoLink(event,${s.id})">Undo link</span>` : ''}
+          </div>
         </div>${badge}
       </div>`;
     }).join('');
@@ -372,6 +386,38 @@ function copyAcct(ev, acct){
   ev.stopPropagation();
   if (!acct) return;
   navigator.clipboard?.writeText(acct).then(()=>toast('Account number copied'));
+}
+
+// ── Roster guardian phone ──────────────────────────
+// A parent whose verified phone matches gets this child in the app.
+async function editPhone(ev, id){
+  ev.stopPropagation();
+  const s = students.find(x => x.id === id);
+  const v = prompt(`Guardian phone for ${s.name}\n(e.g. 0700 111 222; leave empty to clear)`,
+                   s.guardian_phone || '');
+  if (v === null) return;
+  const res = await fetch(`${API}/students/${id}/guardian-phone?phone=${encodeURIComponent(v)}`,
+                          {method:'PUT', headers:H()});
+  if (res.status === 401){ sessionExpired(); return; }
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok){ alert(data.detail || ('HTTP ' + res.status)); return; }
+  s.guardian_phone = data.guardian_phone;
+  render(); toast('Guardian phone saved');
+}
+
+// ── Undo a card linked to the wrong child ──────────
+// Allowed only while nothing has been bought with it; the card can then
+// be linked to the right child.
+async function undoLink(ev, id){
+  ev.stopPropagation();
+  const s = students.find(x => x.id === id);
+  if (!confirm(`Unlink card ${uidOf(s)} from ${s.name}?\n\nUse this only for a card linked to the wrong child.`)) return;
+  const res = await fetch(`${API}/students/${id}/undo-card-link`, {method:'POST', headers:H()});
+  if (res.status === 401){ sessionExpired(); return; }
+  const data = await res.json().catch(()=>({}));
+  if (!res.ok){ alert(data.detail || ('HTTP ' + res.status)); return; }
+  s.nfc = {tag_uid: null, status: 'not assigned'};
+  load(); toast('Card unlinked');
 }
 
 document.getElementById('q').addEventListener('input', render);
