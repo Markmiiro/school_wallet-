@@ -211,3 +211,10 @@ def test_migration_adds_exactly_the_columns_the_model_declares():
     assert "alter table users" in lowered
     for destructive in ("drop ", "delete ", "update ", "truncate "):
         assert destructive not in lowered
+
+
+def test_served_terms_have_no_unfilled_gaps(client):
+    # _ask() marks wording only the operator can supply. Parents must
+    # never be asked to accept text that still says "[TO CONFIRM".
+    assert "[TO CONFIRM" not in client.get("/auth/terms").text
+    assert "[PLACEHOLDER" not in client.get("/auth/terms").text

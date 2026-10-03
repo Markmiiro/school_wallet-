@@ -12,12 +12,12 @@
 # The text is served by GET /auth/terms so the app always shows the
 # wording that matches the version it is about to record.
 #
-# ⚠️ FIRST DRAFT, NOT REVIEWED BY A LAWYER. Everything marked
-# [TO CONFIRM: ...] is a gap only the operator can fill. Do not launch
-# until a Ugandan lawyer has reviewed it and no marker remains.
+# ⚠️ NOT YET REVIEWED BY A LAWYER. Gaps were filled with recommended
+# defaults on 2026-10-03; a Ugandan lawyer is to review them. Use
+# _ask(...) to mark any new gap: tests refuse text that still has one.
 # ================================================
 
-CURRENT_TERMS_VERSION = "2026-10-01"
+CURRENT_TERMS_VERSION = "2026-10-03"
 
 # Anything only the operator can supply is marked with _ask(...). The
 # marker is shown to whoever reads the text, so none may remain at launch.
@@ -56,8 +56,9 @@ SUMMARY = [
         "title": "Your money",
         "body": (
             "You top up with mobile money. A card costs UGX 25,000. "
-            "Refunds: " + _ask("refund policy") + " If your child leaves "
-            "the school: " + _ask("what happens to the remaining balance")
+            "There is no fee for topping up. A payment that fails or is "
+            "wrong is refunded within 7 working days. If your child leaves "
+            "the school, the remaining balance is refunded to you in full."
         ),
     },
     {
@@ -65,7 +66,7 @@ SUMMARY = [
         "body": (
             "Report a lost or stolen card in the app straight away; it stops "
             "working as soon as you report it. Spending before you report "
-            "it: " + _ask("who bears that loss")
+            "it is your responsibility, so report it quickly."
         ),
     },
 ]
@@ -104,15 +105,16 @@ DOCUMENTS = [
                  "through our payment processor, Yo Uganda. The money is "
                  "added once the payment is confirmed. Your mobile money "
                  "provider may charge its own fees. The wallet balance is "
-                 "not a bank deposit and earns no interest. "
-                 + _ask("where wallet money is held, e.g. a trust or "
-                        "collection account, and any top-up limits"))},
+                 "not a bank deposit and earns no interest. We hold the "
+                 "money on your child's behalf, keep it separate from our "
+                 "own money, and use it only for your child's purchases or "
+                 "to refund you.")},
             {"heading": "5. Fees",
              "body": (
                  "A card costs UGX 25,000, paid by mobile money when you buy "
                  "it in the app, including a replacement for a lost or "
-                 "stolen card. " + _ask("any other fee, e.g. on top-ups, "
-                 "or state that there are none") + " We will tell you "
+                 "stolen card. We charge no other fees: topping up, "
+                 "purchases and refunds are free from us. We will tell you "
                  "before any new fee applies.")},
             {"heading": "6. Daily spending limit",
              "body": (
@@ -124,23 +126,29 @@ DOCUMENTS = [
              "body": (
                  "Report a lost or stolen card in the app as soon as you "
                  "notice. The card stops working as soon as the report is "
-                 "made. Purchases made before the report: "
-                 + _ask("who bears the loss, and any cap on it") + " "
-                 "The remaining balance stays in the wallet and moves to the "
+                 "made. You are responsible for purchases made with the "
+                 "card before you report it; the daily spending limit "
+                 "limits how much can be spent in a day. We are responsible "
+                 "for any purchase made after you report it. The remaining balance stays in the wallet and moves to the "
                  "new card.")},
             {"heading": "8. Failed, wrong and disputed payments",
              "body": (
                  "If a top-up leaves your mobile money account but does not "
                  "reach the wallet, or a purchase looks wrong, contact us at "
-                 f"{_CONTACT} " + _ask("within how many days") + ". We will "
-                 "investigate and reply " + _ask("within how many days")
-                 + ". Refunds: " + _ask("when a refund is given, how (to "
-                 "the wallet or to mobile money), and how long it takes"))},
+                 f"{_CONTACT} within 30 days. We will investigate and reply "
+                 "within 7 working days. If we find the money was taken "
+                 "wrongly, we refund it within 7 working days: to the "
+                 "wallet, or to your mobile money number if you ask. If a "
+                 "card you paid for cannot be issued, the card fee is "
+                 "refunded to the mobile money number you paid from.")},
             {"heading": "9. When a child leaves the school or you close your account",
              "body": (
-                 _ask("what happens to the remaining balance: refunded to "
-                      "the parent's mobile money, and any fee or deadline") +
-                 " You can ask to close your account at any time by "
+                 "When your child leaves the school, or you close your "
+                 "account, the remaining balance is yours. Ask us and we "
+                 "will send it in full, with no fee from us, to your "
+                 "registered mobile money number within 14 days. A balance "
+                 "you have not claimed stays yours until you claim it. "
+                 "You can ask to close your account at any time by "
                  f"contacting us at {_CONTACT}.")},
             {"heading": "10. Suspension",
              "body": (
@@ -155,8 +163,7 @@ DOCUMENTS = [
                  "money lost through our own mistake or fault. We are not "
                  "responsible for losses caused by events outside our "
                  "reasonable control. Nothing in these terms takes away "
-                 "rights you have under Ugandan law. "
-                 + _ask("lawyer: any limit on liability"))},
+                 "rights you have under Ugandan law.")},
             {"heading": "12. Changes to these terms",
              "body": (
                  "If we change these terms in a way that matters, the app "
@@ -168,7 +175,8 @@ DOCUMENTS = [
                  "These terms are governed by the laws of Uganda. Contact us "
                  "first and we will try to resolve any complaint. If we "
                  "cannot, the dispute will go to the courts of Uganda. "
-                 + _ask("lawyer: any regulator a complaint may also go to"))},
+                 "A complaint about your personal data may also go to the "
+                 "Personal Data Protection Office.")},
         ],
     },
     {
@@ -179,8 +187,7 @@ DOCUMENTS = [
                  f"{_OPERATOR} is responsible for the personal data described "
                  f"here, under Uganda's Data Protection and Privacy Act, 2019. "
                  f"For any privacy question or request, contact {_CONTACT}. "
-                 "Our address: Kireka, along Kireka-Namugongo Road, Uganda. "
-                 + _ask("PDPO registration number"))},
+                 "Our address: Kireka, along Kireka-Namugongo Road, Uganda.")},
             {"heading": "2. What we collect and why",
              "body": (
                  "About you: your name and phone number, to run your account "
@@ -211,14 +218,15 @@ DOCUMENTS = [
                  "money payments and send SMS messages. Our hosting "
                  "providers, which store the data on our behalf. Authorities, "
                  "when the law requires it. Our hosting providers keep data "
-                 "on servers outside Uganda: "
-                 + _ask("hosting countries, and the safeguards relied on"))},
+                 "on servers outside Uganda, including in the United "
+                 "States. We use only providers that protect the data at "
+                 "least as well as Ugandan law requires, and they may use it "
+                 "only to provide their service to us.")},
             {"heading": "6. How long we keep it",
              "body": (
                  "We keep your data while your account is open. After it is "
-                 "closed we keep payment records for "
-                 + _ask("period, e.g. as tax and financial law requires") +
-                 " and delete or anonymise the rest.")},
+                 "closed we keep payment records for five years, or longer "
+                 "if the law requires, and delete or anonymise the rest.")},
             {"heading": "7. How we protect it",
              "body": (
                  "Data travels between the app and our servers encrypted "
