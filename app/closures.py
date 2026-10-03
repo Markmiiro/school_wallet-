@@ -151,8 +151,11 @@ def request_closure(db: Session, user: User, via: str) -> AccountClosure:
             frozen.append(wallet.id)
 
     closed = {}
+    # Working cards and paused ones: a blocked card must not come back
+    # to life on a closed account.
     for card in db.query(NFCTag).filter(NFCTag.student_id.in_(student_ids),
-                                        NFCTag.is_active == True).all() \
+                                        (NFCTag.is_active == True) |
+                                        (NFCTag.status == "blocked")).all() \
             if student_ids else []:
         closed[str(card.id)] = card.status or "active"
         card.is_active = False
@@ -203,7 +206,7 @@ def cancel(db: Session, closure: AccountClosure) -> None:
     for card_id, previous in json.loads(closure.closed_cards or "{}").items():
         card = db.get(NFCTag, int(card_id))
         if card and card.status == "closed":
-            card.is_active = True
+            card.is_active = previous == "active"
             card.status = previous
             card.deactivated_at = None
 

@@ -360,6 +360,11 @@ def nfc_payment(
         )
 
     if not nfc.is_active:
+        if nfc.status == "blocked":
+            raise HTTPException(
+                status_code=403,
+                detail="This card is paused by the parent. Ask them to unblock it in the app."
+            )
         raise HTTPException(
             status_code=403,
             detail=f"This card has been deactivated ({nfc.status}). Contact school admin."

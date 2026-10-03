@@ -508,6 +508,8 @@ def test_analytics_are_scoped_to_the_admins_school(
 
 # ══════════════════════════════════════════════════════
 # 6. Daily limit — settable, and still enforced
+# Since 3 Oct 2026 a change needs the caller's PIN, in a JSON body:
+# {"daily_limit": N, "pin": "1234"} (tests/test_spending_controls.py).
 # ══════════════════════════════════════════════════════
 
 def test_parent_sets_own_childs_daily_limit_and_it_is_enforced(
@@ -516,7 +518,8 @@ def test_parent_sets_own_childs_daily_limit_and_it_is_enforced(
     student, wallet, nfc = student_with_wallet
 
     res = client.put(
-        f"/wallets/{student.id}/limit", params={"daily_limit": 3000}, headers=auth_headers,
+        f"/wallets/{student.id}/limit", json={"daily_limit": 3000, "pin": "1234"},
+        headers=auth_headers,
     )
     assert res.status_code == 200
     assert res.json()["old_limit"] == 20000
@@ -546,9 +549,10 @@ def test_daily_limit_cannot_be_set_by_strangers_or_till_staff(
     other_admin = make_admin(db_session, second_school, phone="256700999036")
 
     url = f"/wallets/{student.id}/limit"
-    assert client.put(url, params={"daily_limit": 3000}).status_code == 401
+    body = {"daily_limit": 3000, "pin": "1234"}
+    assert client.put(url, json=body).status_code == 401
     for headers in (headers_for(intruder), headers_for(other_admin), staff_headers):
-        assert client.put(url, params={"daily_limit": 3000}, headers=headers).status_code == 403
+        assert client.put(url, json=body, headers=headers).status_code == 403
 
     db_session.refresh(wallet)
     assert wallet.daily_limit == 20000
@@ -557,7 +561,8 @@ def test_daily_limit_cannot_be_set_by_strangers_or_till_staff(
 def test_school_admin_can_set_daily_limit(client, student_with_wallet, admin_headers):
     student, _, _ = student_with_wallet
     res = client.put(
-        f"/wallets/{student.id}/limit", params={"daily_limit": 15000}, headers=admin_headers,
+        f"/wallets/{student.id}/limit", json={"daily_limit": 15000, "pin": "1234"},
+        headers=admin_headers,
     )
     assert res.status_code == 200
 
@@ -566,6 +571,7 @@ def test_school_admin_can_set_daily_limit(client, student_with_wallet, admin_hea
 def test_daily_limit_bounds(client, student_with_wallet, auth_headers, bad):
     student, _, _ = student_with_wallet
     res = client.put(
-        f"/wallets/{student.id}/limit", params={"daily_limit": bad}, headers=auth_headers,
+        f"/wallets/{student.id}/limit", json={"daily_limit": bad, "pin": "1234"},
+        headers=auth_headers,
     )
     assert res.status_code == 422

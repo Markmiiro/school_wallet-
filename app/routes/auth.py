@@ -6,6 +6,7 @@
 # POST /auth/login    → get a JWT token
 # POST /auth/register → create a new user
 # GET  /auth/me       → get current user info
+# POST /auth/unlock   → check the PIN for the app's lock screen
 # POST /auth/change-pin → change PIN
 # ================================================
 
@@ -132,6 +133,21 @@ def check_pin_or_lock(db: Session, user: User, pin: str) -> None:
             status_code=401,
             detail=f"Incorrect PIN. {attempts_left} attempt(s) remaining before lockout."
         )
+
+
+def confirm_pin(db: Session, user: User, pin: str) -> None:
+    """
+    check_pin_or_lock() for a signed-in user re-entering their PIN (the
+    lock screen, money controls). A wrong PIN is answered 400, not 401:
+    the app reads 401 as "your session is gone" and signs the parent
+    out. The lockout (429) passes through unchanged.
+    """
+    try:
+        check_pin_or_lock(db, user, pin)
+    except HTTPException as e:
+        if e.status_code == 401:
+            raise HTTPException(status_code=400, detail=e.detail)
+        raise
 
 
 # Parents only. School staff sign in through the till and card pages,
@@ -310,6 +326,30 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
 # ================================================
 # ENDPOINT 3 — Get current user info
 # ================================================
+class UnlockRequest(BaseModel):
+    pin: str
+
+
+# ================================================
+# POST /auth/unlock
+# The app locks itself after 5 minutes in the background, or when the
+# parent taps Lock. The session stays; this only checks the PIN, here on
+# the server, so the phone never holds the PIN or its hash. Wrong PINs
+# count toward the same lockout as login. A right PIN resets the count.
+# ================================================
+@router.post("/unlock")
+def unlock(
+    data: UnlockRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    confirm_pin(db, current_user, data.pin)
+    current_user.failed_login_attempts = 0
+    current_user.locked_until = None
+    db.commit()
+    return {"unlocked": True}
+
+
 @router.get("/me")
 def get_me(current_user: User = Depends(get_current_user)):
     """

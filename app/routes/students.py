@@ -16,6 +16,9 @@ from app.auth import (
     visible_school_id,
 )
 from app.permissions import clean_name, clean_local_phone
+from app.controls import blocked_card, record_change
+from app.routes.auth import confirm_pin
+from pydantic import BaseModel
 
 router = APIRouter()
 
@@ -385,6 +388,14 @@ def assign_nfc_tag(
     active = student.active_nfc_tag
     now = datetime.utcnow()
 
+    # A card paused by the parent is retired by a replacement: one child,
+    # one usable card. Recorded, since it ends what the parent paused.
+    paused = blocked_card(student)
+    if paused is not None:
+        paused.status = "replaced"
+        paused.deactivated_at = now
+        record_change(db, student, current_user, "card", "blocked", "replaced")
+
     if active is None:
         # No usable card right now — either this student has no nfc_tags
         # row at all (shouldn't happen post-registration, but be safe),
@@ -573,6 +584,92 @@ def deactivate_student(
 # (per the one-to-many NFCTag model) creates a fresh card row rather
 # than reviving this one; this tag_uid can never be reassigned.
 # ================================================
+class PinConfirm(BaseModel):
+    pin: str
+
+
+def _student_for_card_control(db: Session, student_id: int, user: User) -> Student:
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if user.role == "admin":
+        assert_school_access(user, student.school_id)
+    elif user.role == "parent":
+        if student.parent_id != user.id:
+            raise HTTPException(status_code=403, detail="Not permitted")
+    else:
+        raise HTTPException(status_code=403, detail="Not permitted")
+    return student
+
+
+# ================================================
+# POST /students/{student_id}/card/block    {pin}
+# POST /students/{student_id}/card/unblock  {pin}
+# Pause a child's card and resume it — unlike lost/stolen, which retires
+# the card for good. Parent of the child, or an admin of their school.
+# Money controls: the PIN is checked first (wrong PIN 400, counted toward
+# the login lockout) and each change is audited. Unblock is refused once
+# the school has linked a replacement card.
+# ================================================
+@router.post("/{student_id}/card/block")
+def block_card(
+    student_id: int,
+    data: PinConfirm,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    student = _student_for_card_control(db, student_id, current_user)
+    card = student.active_nfc_tag
+    if card is None or card.tag_uid is None:
+        if blocked_card(student) is not None:
+            raise HTTPException(status_code=409, detail="This card is already blocked.")
+        raise HTTPException(status_code=404, detail=f"{student.name} has no card to block.")
+    confirm_pin(db, current_user, data.pin)
+
+    card.is_active = False
+    card.status = "blocked"
+    card.deactivated_at = datetime.utcnow()
+    current_user.failed_login_attempts = 0
+    record_change(db, student, current_user, "card", "active", "blocked")
+    db.commit()
+    return {"student_id": student.id, "card": "blocked"}
+
+
+@router.post("/{student_id}/card/unblock")
+def unblock_card(
+    student_id: int,
+    data: PinConfirm,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    student = _student_for_card_control(db, student_id, current_user)
+    card = blocked_card(student)
+    if card is None:
+        raise HTTPException(status_code=409, detail="There is no blocked card to unblock.")
+    working = student.active_nfc_tag
+    if working is not None and working.tag_uid is not None:
+        raise HTTPException(status_code=409,
+                            detail=f"{student.name} already has a working card.")
+    confirm_pin(db, current_user, data.pin)
+
+    # A replacement was paid for while this card was blocked (allowed, see
+    # cards.py): its empty slot gives way, so the child has one usable
+    # card. The order stays paid, and linking the new card replaces this
+    # one, as when a working card appears while a payment is in flight.
+    if working is not None:
+        working.is_active = False
+        working.status = "replaced"
+        working.deactivated_at = datetime.utcnow()
+
+    card.is_active = True
+    card.status = "active"
+    card.deactivated_at = None
+    current_user.failed_login_attempts = 0
+    record_change(db, student, current_user, "card", "blocked", "active")
+    db.commit()
+    return {"student_id": student.id, "card": "active"}
+
+
 @router.post("/{student_id}/report-stolen")
 def report_card_stolen(
     student_id: int,
@@ -598,11 +695,16 @@ def report_card_stolen(
 
     nfc = student.active_nfc_tag
     if nfc is None or nfc.tag_uid is None:
+        # A paused card can still be lost: reporting it retires it for good.
+        nfc = blocked_card(student)
+    if nfc is None or nfc.tag_uid is None:
         raise HTTPException(status_code=400, detail=f"{student.name} has no active card to report")
 
+    previous = nfc.status or "active"
     nfc.is_active = False
     nfc.status = reason
     nfc.deactivated_at = datetime.utcnow()
+    record_change(db, student, current_user, "card", previous, reason)
     db.commit()
 
     return {

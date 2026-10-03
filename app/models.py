@@ -426,3 +426,25 @@ class PhoneVerification(Base):
     sent_at     = Column(DateTime, nullable=False, default=datetime.utcnow)
     expires_at  = Column(DateTime, nullable=False)
     verified_at = Column(DateTime, nullable=True)
+
+
+# ════════════════════════════════════════════════
+# CONTROL CHANGES
+# Audit trail for a child's money controls: the daily limit and the card
+# state (block, unblock, lost/stolen, replaced). One row per change: who
+# (user and role at the time), what, from, to, when. Written in the same
+# transaction as the change itself, so a change never lands unrecorded.
+# Values are text so one column fits limits ("20000") and card states
+# ("active", "blocked"). Never edited or deleted.
+# ════════════════════════════════════════════════
+class ControlChange(Base):
+    __tablename__ = "control_changes"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    student_id    = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    actor_role    = Column(String, nullable=False)    # parent | admin
+    control       = Column(String, nullable=False)    # daily_limit | card
+    old_value     = Column(String, nullable=True)
+    new_value     = Column(String, nullable=True)
+    created_at    = Column(DateTime, nullable=False, default=datetime.utcnow)

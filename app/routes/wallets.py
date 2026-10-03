@@ -1,10 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Wallet, Transaction, Student, User
+from app.models import Wallet, Transaction, Student, User, ControlChange
 from app.auth import get_current_user, assert_school_access
 from app.permissions import assert_wallet_access
+from app.controls import card_state, record_change
+from app.routes.auth import confirm_pin
+from app.routes.payments import _spent_today
 
 router = APIRouter()
 
@@ -157,6 +161,79 @@ def get_transaction_history(
     }
 
 
+def _assert_controls_access(user: User, student: Student) -> None:
+    """The child's own parent, or an admin of the child's school. Not till staff."""
+    if user.role == "admin":
+        assert_school_access(user, student.school_id)
+    elif user.role == "parent":
+        if student.parent_id != user.id:
+            raise HTTPException(status_code=403, detail="Not permitted")
+    else:
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+
+def _who(change: ControlChange, viewer: User) -> str:
+    if change.actor_user_id == viewer.id:
+        return "you"
+    return {"admin": "school", "parent": "parent"}.get(change.actor_role, change.actor_role)
+
+
+# ================================================
+# GET /wallets/{student_id}/controls
+# Everything the Controls view shows: the daily limit, today's spend
+# against it (Kampala calendar day, the same sum the payment path uses),
+# the card's state, and the last 20 changes to any of it.
+# ================================================
+@router.get("/{student_id}/controls")
+def get_controls(
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    _assert_controls_access(current_user, student)
+    wallet = db.query(Wallet).filter(Wallet.student_id == student_id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    spent = _spent_today(db, wallet.id)
+    state, card = card_state(student)
+    history = (
+        db.query(ControlChange)
+        .filter(ControlChange.student_id == student_id)
+        .order_by(ControlChange.created_at.desc(), ControlChange.id.desc())
+        .limit(20).all()
+    )
+    return {
+        "student_id": student.id,
+        "daily_limit": wallet.daily_limit,
+        "spent_today": spent,
+        "remaining_today": max(0, wallet.daily_limit - spent),
+        "limit_min": MIN_DAILY_LIMIT,
+        "limit_max": MAX_DAILY_LIMIT,
+        "card": {
+            "state": state,
+            "last_digits": card.tag_uid[-4:] if card is not None and card.tag_uid else None,
+            "can_block": state == "active",
+            "can_unblock": state == "blocked",
+        },
+        "history": [{
+            "by": _who(h, current_user),
+            "control": h.control,
+            "from": h.old_value,
+            "to": h.new_value,
+            "at": h.created_at.isoformat() + "Z",
+        } for h in history],
+    }
+
+
+class LimitChange(BaseModel):
+    daily_limit: int = Field(..., ge=MIN_DAILY_LIMIT, le=MAX_DAILY_LIMIT)
+    pin: str
+
+
 # ================================================
 # PUT /wallets/{student_id}/limit
 # Set the daily spending limit for a child's wallet.
@@ -164,11 +241,15 @@ def get_transaction_history(
 # Callable by the child's own parent, or by an admin scoped to the
 # child's school (or a super admin). Merchants cannot change limits.
 # The limit itself is enforced at charge time in app/routes/payments.py.
+#
+# A money control: the body carries the caller's PIN, checked before
+# anything changes (wrong PIN 400, counted toward the login lockout),
+# and the change is audited in the same transaction.
 # ================================================
 @router.put("/{student_id}/limit")
 def set_daily_limit(
     student_id: int,
-    daily_limit: int = Query(..., ge=MIN_DAILY_LIMIT, le=MAX_DAILY_LIMIT),
+    data: LimitChange,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -177,13 +258,9 @@ def set_daily_limit(
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    if current_user.role == "admin":
-        assert_school_access(current_user, student.school_id)
-    elif current_user.role == "parent":
-        if student.parent_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not permitted")
-    else:
-        raise HTTPException(status_code=403, detail="Not permitted")
+    _assert_controls_access(current_user, student)
+    confirm_pin(db, current_user, data.pin)
+    daily_limit = data.daily_limit
 
     wallet = db.query(Wallet).filter(
         Wallet.student_id == student_id
@@ -193,6 +270,8 @@ def set_daily_limit(
 
     old_limit = wallet.daily_limit
     wallet.daily_limit = daily_limit
+    current_user.failed_login_attempts = 0
+    record_change(db, student, current_user, "daily_limit", old_limit, daily_limit)
     db.commit()
 
     return {
