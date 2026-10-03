@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Date,
-    ForeignKey, DateTime, Boolean, UniqueConstraint
+    ForeignKey, DateTime, Boolean, UniqueConstraint, Text
 )
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -323,11 +323,12 @@ class Payout(Base):
 # it were a top-up. Keeping card fees in their own table means the
 # webhook finds nothing for a CARD-… reference and does nothing.
 #
-# status: pending | paid | failed | fulfilled
+# status: pending | paid | failed | fulfilled | refunded
 #   pending   → charge sent, parent has not approved yet
 #   paid      → Yo confirmed the money; the school owes the child a card
 #   failed    → rejected, timed out, or the charge never started
 #   fulfilled → a card was linked to the child after payment
+#   refunded  → paid, never issued, fee returned when the account closed
 # ════════════════════════════════════════════════
 class CardOrder(Base):
     __tablename__ = "card_orders"
@@ -347,3 +348,48 @@ class CardOrder(Base):
 
     # Relationships
     student = relationship("Student")
+
+
+# ════════════════════════════════════════════════
+# ACCOUNT CLOSURES
+# A parent deleting their account. See app/closures.py for the lifecycle:
+#
+#   held → (72 hours) → refund sent → completed
+#
+# status:
+#   held          → requested; wallets frozen, cards closed, signed out.
+#                   Only an operator can cancel, and only now.
+#   ready         → balances debited into refund_amount; not yet sent
+#   pending       → refund recorded and being sent to Yo
+#   failed        → Yo confirmed the refund did not move; retry allowed
+#   indeterminate → fate unknown; NEVER re-send, resolve by polling Yo
+#   needs_human   → automated retries used up; an operator retries
+#   completed     → refund sent (or nothing owed) and the person removed
+#   cancelled     → undone by an operator during the hold
+#
+# This row outlives the person on purpose: it is the proof the money was
+# returned. refund_phone is dropped after the retention period.
+# There is no column on `users` for this, so no migration must run
+# before the code that reads `users` is deployed.
+# ════════════════════════════════════════════════
+class AccountClosure(Base):
+    __tablename__ = "account_closures"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    status        = Column(String, nullable=False, default="held")
+    requested_via = Column(String, nullable=False)   # app | web
+    refund_phone  = Column(String, nullable=True)    # the registered number; dropped after retention
+    refund_amount = Column(Integer, nullable=True)   # UGX, fixed when the wallets are debited
+    attempts      = Column(Integer, nullable=False, default=0)
+    yo_reference  = Column(String, nullable=True)    # NUV-CLOSE-{id}-{attempt}, last attempt
+    # What the request froze, so a cancel restores exactly that and not
+    # a wallet the parent had frozen themselves. JSON.
+    frozen_wallet_ids = Column(Text, nullable=False, default="[]")
+    closed_cards      = Column(Text, nullable=False, default="{}")   # {card_id: previous status}
+    requested_at  = Column(DateTime, nullable=False, default=datetime.utcnow)
+    process_after = Column(DateTime, nullable=False)
+    last_sent_at  = Column(DateTime, nullable=True)
+    refunded_at   = Column(DateTime, nullable=True)
+    completed_at  = Column(DateTime, nullable=True)
+    cancelled_at  = Column(DateTime, nullable=True)

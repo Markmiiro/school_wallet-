@@ -97,6 +97,43 @@ def get_terms():
 
 
 # ── Who must have accepted the current terms to log in ──
+def check_pin_or_lock(db: Session, user: User, pin: str) -> None:
+    """
+    Raise unless `pin` is right for `user`. A wrong PIN counts toward the
+    lockout: LOCKOUT_MINUTES after MAX_FAILED_ATTEMPTS in a row.
+
+    Shared by login and account deletion, so a PIN cannot be guessed
+    through one after the other has locked it.
+    """
+    # ── Check if account is currently locked ───────
+    if user.locked_until and user.locked_until > datetime.utcnow():
+        minutes_left = int((user.locked_until - datetime.utcnow()).total_seconds() / 60) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {minutes_left} minute(s)."
+        )
+
+    # ── Verify PIN ──────────────────────────────────
+    if not verify_pin(pin, user.pin_hash):
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+
+        if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+            user.locked_until = datetime.utcnow() + timedelta(minutes=LOCKOUT_MINUTES)
+            db.commit()
+            print(f"🔒 Account locked: {user.name} ({user.phone}) — too many failed attempts")
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Account locked for {LOCKOUT_MINUTES} minutes."
+            )
+
+        db.commit()
+        attempts_left = MAX_FAILED_ATTEMPTS - user.failed_login_attempts
+        raise HTTPException(
+            status_code=401,
+            detail=f"Incorrect PIN. {attempts_left} attempt(s) remaining before lockout."
+        )
+
+
 # Parents only. School staff sign in through the till and card pages,
 # which have no acceptance screen; gating them here would lock every
 # till out the moment the version changes.
@@ -138,33 +175,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
             detail=f"Incorrect PIN. {MAX_FAILED_ATTEMPTS - 1} attempt(s) remaining before lockout."
         )
 
-    # ── Check if account is currently locked ───────
-    if user.locked_until and user.locked_until > datetime.utcnow():
-        minutes_left = int((user.locked_until - datetime.utcnow()).total_seconds() / 60) + 1
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many failed attempts. Try again in {minutes_left} minute(s)."
-        )
-
-    # ── Verify PIN ──────────────────────────────────
-    if not verify_pin(data.pin, user.pin_hash):
-        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
-
-        if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
-            user.locked_until = datetime.utcnow() + timedelta(minutes=LOCKOUT_MINUTES)
-            db.commit()
-            print(f"🔒 Account locked: {user.name} ({user.phone}) — too many failed attempts")
-            raise HTTPException(
-                status_code=429,
-                detail=f"Too many failed attempts. Account locked for {LOCKOUT_MINUTES} minutes."
-            )
-
-        db.commit()
-        attempts_left = MAX_FAILED_ATTEMPTS - user.failed_login_attempts
-        raise HTTPException(
-            status_code=401,
-            detail=f"Incorrect PIN. {attempts_left} attempt(s) remaining before lockout."
-        )
+    check_pin_or_lock(db, user, data.pin)
 
     # ── Success: reset the counters ─────────────────
     user.failed_login_attempts = 0

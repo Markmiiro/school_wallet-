@@ -94,7 +94,7 @@ def _build_test_app():
     from app.routes import (
         payments, tuckshop, merchants, webhook, auth as auth_routes,
         students, topup, schools, users, reports, diagnostics,
-        wallets, analytics, cards,
+        wallets, analytics, cards, account,
     )
 
     app = FastAPI()
@@ -112,6 +112,7 @@ def _build_test_app():
     app.include_router(wallets.router, prefix="/wallets", tags=["Wallets"])
     app.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
     app.include_router(cards.router, prefix="/cards", tags=["Card Orders"])
+    app.include_router(account.router, prefix="/account", tags=["Account"])
     return app
 
 

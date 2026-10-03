@@ -8,7 +8,8 @@
 # GET  /reports/merchant/{id}/dashboard  → merchant summary
 # GET  /reports/school/{id}/settlement   → admin settlement report
 # POST /reports/school/{id}/payout       → trigger manual payout
-# POST /reports/settlements/auto         → automated daily payout
+# POST /reports/settlements/auto         → automated daily payout,
+#                                          and due account-closure refunds
 # ================================================
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -1183,6 +1184,12 @@ async def automated_daily_payout(
 
     grand_total = sum(r["total_ugx"] for r in results)
 
+    # Account closures ride on the same daily run: refunds due after their
+    # 72-hour hold, polls of unknown ones. Imported here, not at the top,
+    # because app/closures.py imports this module.
+    from app.closures import process_due
+    closure_results = await process_due(db, automated=True)
+
     print(f"\n🏦 Auto settlement complete: UGX {grand_total:,} across {len(schools)} schools")
 
     return {
@@ -1190,5 +1197,6 @@ async def automated_daily_payout(
         "schools":     len(schools),
         "grand_total_ugx": grand_total,
         "results":     results,
+        "account_closures": closure_results,
         "completed_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }

@@ -20,6 +20,7 @@ from app.routes import tuckshop
 from app.routes import issue
 from app.routes import diagnostics
 from app.routes import cards
+from app.routes import account
 
 
 
@@ -93,4 +94,5 @@ app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(tuckshop.router, prefix="/tuckshop", tags=["Tuck Shop"])
 app.include_router(issue.router, prefix="/issue", tags=["Card Issuance"])
 app.include_router(cards.router, prefix="/cards", tags=["Card Orders"])
+app.include_router(account.router, prefix="/account", tags=["Account"])
 app.include_router(diagnostics.router, prefix="/diagnostics", tags=["Diagnostics"])
