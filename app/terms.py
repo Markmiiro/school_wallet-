@@ -25,8 +25,8 @@ def _ask(what: str) -> str:
     return f"[TO CONFIRM: {what}]"
 
 
-_OPERATOR = _ask("legal name of the company or person running Nuvora")
-_CONTACT = _ask("support phone number, email and physical address")
+_OPERATOR = "Miiro Technologies"
+_CONTACT = "0760 945 424 or markmiiro77@gmail.com"
 
 # Short, plain points shown on the acceptance screen itself.
 SUMMARY = [
@@ -179,6 +179,7 @@ DOCUMENTS = [
                  f"{_OPERATOR} is responsible for the personal data described "
                  f"here, under Uganda's Data Protection and Privacy Act, 2019. "
                  f"For any privacy question or request, contact {_CONTACT}. "
+                 "Our address: " + _ask("physical or postal address in Uganda") + " "
                  + _ask("PDPO registration number"))},
             {"heading": "2. What we collect and why",
              "body": (
