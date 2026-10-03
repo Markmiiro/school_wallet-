@@ -28,6 +28,7 @@ from tests.conftest import (
     make_merchant_user,
     make_student_with_wallet,
 )
+from app.terms import CURRENT_TERMS_VERSION
 
 
 def _make_parent(db_session, *, phone, name="Other Parent"):
@@ -161,7 +162,10 @@ def test_create_user_accepts_json_body_so_the_pin_stays_out_of_the_url(client, s
         headers=super_admin_headers,
     )
     assert res.status_code == 200
-    login = client.post("/auth/login", json={"phone": "256700555903", "pin": "4321"})
+    login = client.post("/auth/login", json={
+        "phone": "256700555903", "pin": "4321",
+        "accept_terms_version": CURRENT_TERMS_VERSION,
+    })
     assert login.status_code == 200
 
 

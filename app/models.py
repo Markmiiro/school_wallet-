@@ -30,6 +30,16 @@ class User(Base):
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until           = Column(DateTime, nullable=True)
 
+    # Terms and privacy acceptance: WHICH version this user agreed to and
+    # WHEN (UTC). Both NULL means "has not accepted". Compared against
+    # CURRENT_TERMS_VERSION in app/terms.py at signup and login.
+    #
+    # MIGRATION NOTE: these are NOT in create_tables()' self-heal list on
+    # purpose. Apply migrations/2026_10_02_add_terms_acceptance.sql by
+    # hand before deploying; every query on users selects them.
+    terms_version     = Column(String, nullable=True)
+    terms_accepted_at = Column(DateTime, nullable=True)
+
     # Relationships
     students = relationship("Student", back_populates="parent")
 

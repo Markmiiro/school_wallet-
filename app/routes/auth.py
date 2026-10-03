@@ -2,6 +2,7 @@
 # app/routes/auth.py
 # ------------------------------------------------
 # Authentication endpoints:
+# GET  /auth/terms    → current terms and privacy text + version
 # POST /auth/login    → get a JWT token
 # POST /auth/register → create a new user
 # GET  /auth/me       → get current user info
@@ -9,8 +10,10 @@
 # ================================================
 
 from datetime import datetime, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
@@ -18,6 +21,7 @@ from pydantic import BaseModel, field_validator
 from app.database import get_db
 from app.models import User
 from app.auth import hash_pin, verify_pin, create_access_token, get_current_user
+from app import terms
 
 router = APIRouter()
 
@@ -33,6 +37,9 @@ LOCKOUT_MINUTES = 15
 class LoginRequest(BaseModel):
     phone: str
     pin: str
+    # Sent by the app after the parent has read and accepted the terms
+    # it was shown. Must be the current version to count.
+    accept_terms_version: Optional[str] = None
 
 class RegisterRequest(BaseModel):
     """
@@ -49,6 +56,9 @@ class RegisterRequest(BaseModel):
     name: str
     phone: str
     pin: str
+    # The version of the terms the parent accepted on the screen before
+    # this form. No account is created unless it is the current one.
+    terms_version: Optional[str] = None
 
     @field_validator("pin")
     def pin_must_be_4_digits(cls, v):
@@ -72,6 +82,26 @@ class ChangePinRequest(BaseModel):
         if not v.isdigit() or len(v) != 4:
             raise ValueError("New PIN must be exactly 4 digits")
         return v
+
+
+# ================================================
+# ENDPOINT 0 — The terms a parent is asked to accept
+# ================================================
+@router.get("/terms")
+def get_terms():
+    """
+    Public. The current version, the summary shown on the acceptance
+    screen, and the full Terms of Use and Privacy Policy.
+    """
+    return terms.terms_payload()
+
+
+# ── Who must have accepted the current terms to log in ──
+# Parents only. School staff sign in through the till and card pages,
+# which have no acceptance screen; gating them here would lock every
+# till out the moment the version changes.
+def _must_accept_terms(user: User) -> bool:
+    return user.role == "parent" and user.terms_version != terms.CURRENT_TERMS_VERSION
 
 
 # ================================================
@@ -139,6 +169,28 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     # ── Success: reset the counters ─────────────────
     user.failed_login_attempts = 0
     user.locked_until = None
+
+    # ── Terms: the PIN is right, but no token until the current terms
+    #    are accepted. Checked only after the PIN, so this answer is
+    #    never given to someone who does not know it. ──
+    if _must_accept_terms(user):
+        if not terms.is_current(data.accept_terms_version):
+            db.commit()
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": (
+                        "Please read and accept the Nuvora terms and privacy "
+                        "policy to continue. If you do not see them, refresh "
+                        "the app."
+                    ),
+                    "code": "terms_required",
+                    "terms_version": terms.CURRENT_TERMS_VERSION,
+                },
+            )
+        user.terms_version = terms.CURRENT_TERMS_VERSION
+        user.terms_accepted_at = datetime.utcnow()
+
     db.commit()
 
     # Create token
@@ -175,6 +227,17 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
     Public self-signup. Always creates a parent account — see
     RegisterRequest's docstring for why role/school_id aren't inputs.
     """
+    # Acceptance comes BEFORE the account exists, and it must be of the
+    # version in force now — not a stale one, and not a bare "yes".
+    if not terms.is_current(data.terms_version):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Accept the current terms and privacy policy to create an "
+                "account."
+            ),
+        )
+
     # Check phone not already registered (fast path; the try/except
     # below is what actually protects against a concurrent duplicate,
     # since this check-then-act has a race window of its own).
@@ -195,6 +258,8 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
         pin_hash=hash_pin(data.pin),
         role="parent",
         school_id=None,
+        terms_version=terms.CURRENT_TERMS_VERSION,
+        terms_accepted_at=datetime.utcnow(),
     )
     db.add(user)
     try:

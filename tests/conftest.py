@@ -32,6 +32,8 @@ os.environ.setdefault("SECRET_KEY", "test-only-secret-not-for-production")
 # Ensures app/momo.py's _is_test_mode() short-circuits to fake Yo calls.
 os.environ.setdefault("APP_ENV", "development")
 
+from datetime import datetime
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -42,6 +44,7 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base, get_db
 from app import models
 from app.auth import create_access_token, hash_pin
+from app.terms import CURRENT_TERMS_VERSION
 
 # Importing this registers PendingUssdRegistration (defined in ussd.py, on
 # the same Base) with Base.metadata *before* any test's create_all() runs.
@@ -164,6 +167,10 @@ def parent_user(db_session):
         phone="256700111222",
         role="parent",
         pin_hash=hash_pin("1234"),
+        # Already accepted the current terms, so /auth/login works for
+        # tests that are not about acceptance (see test_terms_acceptance.py).
+        terms_version=CURRENT_TERMS_VERSION,
+        terms_accepted_at=datetime.utcnow(),
     )
     db_session.add(u)
     db_session.commit()

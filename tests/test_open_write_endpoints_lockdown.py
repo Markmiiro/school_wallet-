@@ -28,6 +28,7 @@
 
 from app.models import User
 from tests.conftest import make_admin, headers_for
+from app.terms import CURRENT_TERMS_VERSION
 
 
 # ══════════════════════════════════════════════════════
@@ -206,7 +207,10 @@ def test_created_user_can_actually_log_in_with_the_set_pin(client, super_admin_h
     )
     assert res.status_code == 200
 
-    login_res = client.post("/auth/login", json={"phone": "256700555016", "pin": "4321"})
+    login_res = client.post("/auth/login", json={
+        "phone": "256700555016", "pin": "4321",
+        "accept_terms_version": CURRENT_TERMS_VERSION,
+    })
     assert login_res.status_code == 200
     assert login_res.json()["token"]
 

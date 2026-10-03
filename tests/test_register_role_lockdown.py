@@ -24,6 +24,7 @@ import os
 import pytest
 
 from app.models import User
+from app.terms import CURRENT_TERMS_VERSION
 
 
 def test_register_with_role_admin_is_ignored_creates_parent(client, db_session):
@@ -36,7 +37,7 @@ def test_register_with_role_admin_is_ignored_creates_parent(client, db_session):
     res = client.post("/auth/register", json={
         "name": "Attacker",
         "phone": "256700555001",
-        "pin": "1234",
+        "pin": "1234", "terms_version": CURRENT_TERMS_VERSION,
         "role": "admin",
     })
     assert res.status_code == 200
@@ -52,7 +53,7 @@ def test_register_with_role_merchant_and_school_id_is_ignored_creates_parent(cli
     res = client.post("/auth/register", json={
         "name": "Attacker Two",
         "phone": "256700555002",
-        "pin": "1234",
+        "pin": "1234", "terms_version": CURRENT_TERMS_VERSION,
         "role": "merchant",
         "school_id": school.id,
     })
@@ -75,7 +76,7 @@ def test_register_with_no_role_field_still_works(client):
     res = client.post("/auth/register", json={
         "name": "Ordinary Parent",
         "phone": "256700555004",
-        "pin": "1234",
+        "pin": "1234", "terms_version": CURRENT_TERMS_VERSION,
     })
     assert res.status_code == 200
     assert res.json()["user"]["role"] == "parent"
@@ -89,11 +90,11 @@ def test_duplicate_phone_registration_returns_clean_400_sequential(client):
     that wrapping the insert in try/except IntegrityError didn't change
     this path's behavior.
     """
-    payload = {"name": "First", "phone": "256700555003", "pin": "1234"}
+    payload = {"name": "First", "phone": "256700555003", "pin": "1234", "terms_version": CURRENT_TERMS_VERSION}
     res1 = client.post("/auth/register", json=payload)
     assert res1.status_code == 200
 
-    payload2 = {"name": "Second", "phone": "256700555003", "pin": "5678"}
+    payload2 = {"name": "Second", "phone": "256700555003", "pin": "5678", "terms_version": CURRENT_TERMS_VERSION}
     res2 = client.post("/auth/register", json=payload2)
     assert res2.status_code == 400
     assert "already registered" in res2.json()["detail"].lower()
@@ -123,7 +124,7 @@ def test_concurrent_duplicate_phone_registration_returns_clean_400_not_500(clien
 
     def fire(name):
         return client.post("/auth/register", json={
-            "name": name, "phone": "256700555005", "pin": "1234",
+            "name": name, "phone": "256700555005", "pin": "1234", "terms_version": CURRENT_TERMS_VERSION,
         })
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
